@@ -1,0 +1,70 @@
+# pyproject.toml for the MediaPipe-based Respiration Monitor project
+
+[build-system]
+requires = ["setuptools>=61.0"] # Specify minimum setuptools version
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "respiration-monitor-mediapipe" # New name reflecting the approach
+version = "0.1.0" # Initial version
+description = "Real-time respiration monitoring using MediaPipe Pose and OSC output."
+readme = "README.md" # Assumes you have a README file
+authors = [
+    { name = "Your Name", email = "your.email@example.com" } # Update with your details
+]
+license = { text = "MIT" } # Or choose another license like "Apache-2.0", "GPL-3.0-only", etc.
+requires-python = ">=3.11,<3.12" # Target Python 3.11 specifically
+classifiers = [
+    "Development Status :: 3 - Alpha", # Initial development stage
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License", # Match the license above
+    "Operating System :: OS Independent", # Assuming cross-platform compatibility
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Multimedia :: Sound/Audio :: MIDI",
+    "Topic :: Multimedia :: Video :: Capture",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+keywords = ["respiration", "breathing", "monitor", "mediapipe", "pose", "opencv", "osc", "max for live", "m4l"]
+
+# --- Core Dependencies ---
+dependencies = [
+    # Pin mediapipe to version 0.10.x (compatible with Python 3.11)
+    # Using ~=0.10.0 allows 0.10.0 up to (but not including) 0.11.0
+    "mediapipe~=0.10.0",
+
+    # Core computer vision library
+    "opencv-python",
+
+    # Numerical computing (often a dependency of others)
+    "numpy",
+
+    # Signal processing (filtering, peak finding)
+    "scipy",
+
+    # UI Plotting
+    "matplotlib",
+
+    # OSC Communication
+    "python-osc",
+]
+
+# --- Optional: Project URLs ---
+[project.urls]
+Homepage = "https://github.com/yourusername/your-repo-name" # Example URL
+Repository = "https://github.com/yourusername/your-repo-name" # Example URL
+# Issues = "https://github.com/yourusername/your-repo-name/issues" # Example URL
+
+# --- Tool Configuration ---
+[tool.setuptools]
+# Tells setuptools where to find the source code package(s)
+# Assumes your main code is inside a directory named 'src'
+packages = ["src"]
+
+# Optional: If using find: directive (more automatic but requires setup)
+# [tool.setuptools.packages.find]
+# where = ["src"]  # look in the src directory for packages
+

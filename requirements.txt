@@ -1,0 +1,13 @@
+# Core dependencies for Respiration Monitor (MediaPipe Pose version)
+
+numpy
+opencv-python
+scipy
+matplotlib
+python-osc
+mediapipe
+
+# Notes:
+# - Specific versions are not pinned here to allow pip to resolve the latest compatible ones.
+# - If you encounter issues, you might need to pin specific versions, e.g., numpy==1.26.0
+# - Ensure your Python version is compatible with MediaPipe (check their documentation).
