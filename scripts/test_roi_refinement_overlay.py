@@ -1,7 +1,7 @@
 # scripts/test_roi_refinement_overlay.py
 # Tests and visualizes the ROI refinement process: Pose -> Coarse ROI -> EVM Refined ROI.
 # Displays the webcam feed with pose landmarks and both ROI boundaries.
-# MODIFIED: Defined and used MAIN_VIZ_WINDOW_NAME constant.
+# Uses VideoInput class and displays EVM variance map.
 # ASSUMES this script lives in a 'scripts' subdirectory of the project root.
 
 import cv2
@@ -24,6 +24,7 @@ if src_dir not in sys.path:
 
 # --- Import necessary classes from src ---
 try:
+    from video_input import VideoInput # Use VideoInput
     from pose_detector import PoseDetector
     # IMPORTANT: Assumes roi_calculator.py has been renamed to coarse_roi_calculator.py
     from coarse_roi_calculator import CoarseRoiCalculator
@@ -33,7 +34,7 @@ except ImportError as e:
     print("Please ensure required modules exist and RoiCalculator has been renamed.")
     sys.exit(1)
 
-print("Initializing Webcam and ROI Components...")
+print("Initializing Webcam (via VideoInput) and ROI Components...")
 
 # --- Load Configuration ---
 config_path = os.path.join(project_root, "profiles", "test_profile.json")
@@ -57,56 +58,37 @@ except Exception as e:
      sys.exit(1)
 
 # Extract specific config sections or use defaults
+video_config = config.get("video_input", {}) # Get video config
 pose_config = config.get("pose_detector", {})
 coarse_roi_config = config.get("coarse_roi_calculator", {})
 evm_config = config.get("evm_processor", {})
 evm_enabled = evm_config.get("EVM_ENABLED", True) # Should be true based on check above
 evm_buffer_seconds = evm_config.get("EVM_BUFFER_SECONDS", 2.0)
 
-DEFAULT_SAMPLING_RATE = 30.0 # Estimate, can be refined
-# --- Define Window Names ---
-MAIN_VIZ_WINDOW_NAME = 'ROI Refinement Test (Pose -> Coarse -> Refined)' # Defined constant
+DEFAULT_SAMPLING_RATE = 30.0 # Fallback sampling rate
 EVM_VIZ_WINDOW_NAME = "EVM Variance Map (2x)"
+MAIN_VIZ_WINDOW_NAME = 'ROI Refinement Test (Pose -> Coarse -> Refined)'
 DISPLAY_WIDTH = 960 # Target width for the main display window
 EVM_VIZ_SCALE_FACTOR = 2.0 # Factor to scale the EVM map window
 
-# --- Plotting Helper Function (Copied from previous script) ---
-# (draw_signal_plot function remains unchanged)
-def draw_signal_plot(title, signal_buffer, peak_indices, plot_width, plot_height, bg_color, line_color, peak_color):
-    """Draws the signal buffer and peaks onto a NumPy array."""
-    plot_img = np.full((plot_height, plot_width, 3), bg_color, dtype=np.uint8)
-    buffer_len = len(signal_buffer)
-    cv2.putText(plot_img, title, (10, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
-    if buffer_len < 2:
-        cv2.putText(plot_img, "Waiting for buffer...", (10, plot_height // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
-        return plot_img
-    signal_np = np.array(signal_buffer)
-    min_val, max_val = np.min(signal_np), np.max(signal_np)
-    range_val = max_val - min_val
-    padding = 0.1 * plot_height
-    if range_val < 1e-6:
-        center_y_flat = plot_height // 2
-        cv2.line(plot_img, (0, center_y_flat), (plot_width -1, center_y_flat), line_color, 1)
-        normalized_signal = np.full(buffer_len, center_y_flat)
-    else:
-        scale = (plot_height - 2 * padding) / range_val
-        normalized_signal = (signal_np - min_val) * scale + padding
-        normalized_signal = plot_height - normalized_signal
-        points = np.zeros((buffer_len, 1, 2), dtype=np.int32)
-        points[:, 0, 0] = np.linspace(0, plot_width - 1, buffer_len, dtype=np.int32)
-        points[:, 0, 1] = normalized_signal.astype(np.int32)
-        cv2.polylines(plot_img, [points], isClosed=False, color=line_color, thickness=1, lineType=cv2.LINE_AA)
-    if peak_indices is not None and len(peak_indices) > 0 and buffer_len > 1:
-        peak_x = (peak_indices / (buffer_len - 1) * (plot_width - 1)).astype(np.int32)
-        valid_peak_indices = np.clip(peak_indices, 0, buffer_len - 1)
-        peak_y = normalized_signal[valid_peak_indices].astype(np.int32)
-        for px, py in zip(peak_x, peak_y):
-             px_clamped, py_clamped = max(0, min(plot_width - 1, px)), max(0, min(plot_height - 1, py))
-             cv2.circle(plot_img, (px_clamped, py_clamped), 4, peak_color, -1)
-    center_y = plot_height // 2
-    cv2.line(plot_img, (0, center_y), (plot_width - 1, center_y), (200, 200, 200), 1)
-    return plot_img
+# --- Plotting Helper Function ---
+# (draw_signal_plot function is not needed for this script, can be removed or kept)
+# def draw_signal_plot(...): ...
+
+# --- Initialize Video Input ---
+video_input = None
+try:
+    video_input = VideoInput(config=video_config)
+    if not video_input.initialized:
+        raise RuntimeError("VideoInput failed to initialize.")
+    # Use actual sampling rate if available, otherwise default
+    actual_fps = video_input.get_fps()
+    sampling_rate = actual_fps if actual_fps > 0 else DEFAULT_SAMPLING_RATE
+    print(f"Using sampling rate for EVM buffer calculation: {sampling_rate:.2f} Hz")
+except Exception as e:
+    print(f"Error initializing VideoInput: {e}")
+    if video_input: video_input.release()
+    sys.exit(1)
 
 
 # --- Initialize Components ---
@@ -117,33 +99,29 @@ grayscale_frame_buffer = None
 try:
     pose_detector = PoseDetector(config=pose_config)
     coarse_roi_calculator = CoarseRoiCalculator(config=coarse_roi_config)
-    if evm_enabled:
-        evm_processor = EvmProcessor(config=evm_config, sampling_rate=DEFAULT_SAMPLING_RATE)
-        evm_buffer_size = int(evm_buffer_seconds * DEFAULT_SAMPLING_RATE)
+    if evm_enabled: # Should always be true here
+        # Pass the determined sampling rate to EvmProcessor
+        evm_processor = EvmProcessor(config=evm_config, sampling_rate=sampling_rate)
+        evm_buffer_size = int(evm_buffer_seconds * sampling_rate) # Calculate based on actual/estimated rate
         grayscale_frame_buffer = collections.deque(maxlen=evm_buffer_size)
         print(f"EVM Enabled. Buffer Size: {evm_buffer_size}")
     else:
          # This case should not be hit due to check during config load
-         print("Error: EVM Processor is disabled but required for this script.")
+         print("Error: EVM Processor could not be enabled/initialized. Exiting.")
+         video_input.release()
          sys.exit(1)
 
 except Exception as e:
     print(f"Error during component initialization: {e}")
     traceback.print_exc()
     if pose_detector: pose_detector.close()
+    video_input.release() # Release video input on error
     sys.exit(1)
 
 # --- MediaPipe Drawing Utilities ---
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 mp_pose = mp.solutions.pose
-
-# --- OpenCV Video Capture Initialization ---
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("Error: Cannot open webcam.")
-    if pose_detector: pose_detector.close()
-    sys.exit()
 
 print("Webcam opened. Displaying Pose, Coarse ROI, and Refined ROI.")
 print("EVM Variance Map will be shown in a separate window.")
@@ -155,14 +133,19 @@ frame_count = 0
 latest_variance_map = None
 latest_refined_roi_local = None
 
-while cap.isOpened():
-    success, frame = cap.read()
-    if not success:
-        print("Ignoring empty camera frame.")
-        continue
+while True: # Loop until user quits or error
+    # --- Read Frame using VideoInput ---
+    success, frame = video_input.get_frame()
+    if not success or frame is None:
+        print("End of video source or cannot read frame. Exiting.")
+        break # Exit loop if frame read fails
 
     frame_count += 1
-    frame_height, frame_width = frame.shape[:2]
+    # Get actual resolution from VideoInput object
+    frame_width, frame_height = video_input.get_resolution()
+    if frame_width == 0 or frame_height == 0: # Check if resolution is valid
+        print("Error: Invalid frame dimensions received from VideoInput. Exiting.")
+        break
 
     # --- Performance calculation (FPS) ---
     curr_time = time.time()
@@ -193,14 +176,19 @@ while cap.isOpened():
                  x_c, y_c, w_c, h_c = coarse_roi_coords
                  cropped_frames_deque = collections.deque(maxlen=grayscale_frame_buffer.maxlen)
                  buffer_valid_for_evm = True
-                 for gray_frame_buffer in grayscale_frame_buffer:
-                     fh, fw = gray_frame_buffer.shape
-                     x1, y1 = max(0, x_c), max(0, y_c)
-                     x2, y2 = min(fw, x_c + w_c), min(fh, y_c + h_c)
-                     if x1 >= x2 or y1 >= y2: buffer_valid_for_evm = False; break
-                     cropped_frames_deque.append(gray_frame_buffer[y1:y2, x1:x2])
+                 # --- Simplified Buffer Cropping ---
+                 try:
+                     for gray_frame_buffer in grayscale_frame_buffer:
+                         fh, fw = gray_frame_buffer.shape
+                         x1, y1 = max(0, x_c), max(0, y_c)
+                         x2, y2 = min(fw, x_c + w_c), min(fh, y_c + h_c)
+                         if x1 >= x2 or y1 >= y2: buffer_valid_for_evm = False; break
+                         cropped_frames_deque.append(gray_frame_buffer[y1:y2, x1:x2])
+                 except Exception as crop_err:
+                      print(f"Error during buffer cropping: {crop_err}")
+                      buffer_valid_for_evm = False
 
-                 if buffer_valid_for_evm:
+                 if buffer_valid_for_evm and len(cropped_frames_deque) == len(grayscale_frame_buffer): # Ensure all frames were cropped
                      refined_roi_list, current_variance_map = evm_processor.find_optimal_roi(
                          cropped_frames_deque, coarse_roi_coords
                      )
@@ -282,7 +270,6 @@ while cap.isOpened():
 
 
     # --- Display the main frame ---
-    # *** FIXED LINE BELOW ***
     cv2.imshow(MAIN_VIZ_WINDOW_NAME, resized_display_frame) # Use the defined constant
 
     # --- Prepare and Display EVM Variance Map Visualization ---
@@ -322,7 +309,7 @@ while cap.isOpened():
 # --- Cleanup ---
 print("Releasing resources...")
 if pose_detector: pose_detector.close()
-cap.release()
+if video_input: video_input.release() # Release VideoInput
 cv2.destroyAllWindows()
 print("Finished.")
 
