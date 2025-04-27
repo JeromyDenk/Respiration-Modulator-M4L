@@ -22,7 +22,7 @@ if src_dir not in sys.path:
 # --- Import necessary classes from src ---
 try:
     from pose_detector import PoseDetector
-    from roi_calculator import RoiCalculator
+    from coarse_roi_calculator import RoiCalculator
     from feature_tracker import FeatureTracker
     from signal_generator import SignalGenerator
     from signal_processor import SignalProcessor

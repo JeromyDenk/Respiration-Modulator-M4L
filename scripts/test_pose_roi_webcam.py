@@ -28,7 +28,7 @@ if src_dir not in sys.path:
 try:
     # Import the classes we need to test
     from pose_detector import PoseDetector
-    from roi_calculator import RoiCalculator
+    from coarse_roi_calculator import RoiCalculator
     # Import config loader to potentially load settings if needed, or use defaults
     from config_loader import load_config
 except ImportError as e:

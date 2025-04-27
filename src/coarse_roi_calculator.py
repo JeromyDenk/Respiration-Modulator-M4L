@@ -1,6 +1,6 @@
-# src/roi_calculator.py
-# Calculates ROI(s) based on detected pose landmarks.
-# MODIFIED: Handles cases where only shoulders are visible.
+# src/coarse_roi_calculator.py
+# Calculates a COARSE ROI based on detected pose landmarks.
+# REFACTORED from roi_calculator.py
 
 import mediapipe as mp
 import numpy as np
@@ -9,15 +9,17 @@ import traceback # For debugging potential errors
 # Define constants for easier landmark access
 mp_pose = mp.solutions.pose
 
-class RoiCalculator:
+# Renamed class
+class CoarseRoiCalculator:
     """
-    Calculates Region(s) of Interest (ROI) based on MediaPipe Pose landmarks.
+    Calculates a coarse Region of Interest (ROI) based on MediaPipe Pose landmarks.
+    This ROI is intended as input for further refinement (e.g., by EVM).
     Handles cases with full torso visibility (shoulders + hips) and
     degraded visibility (shoulders only).
     """
     def __init__(self, config=None):
         """
-        Initializes the RoiCalculator.
+        Initializes the CoarseRoiCalculator.
 
         Args:
             config (dict, optional): Configuration dictionary. Expected keys:
@@ -32,6 +34,8 @@ class RoiCalculator:
         if config is None:
             config = {}
 
+        # Config keys might still refer to 'ROI_' for backward compatibility in profile files,
+        # or you can update profile files to use 'COARSE_ROI_' prefixes.
         self.strategy = config.get('ROI_STRATEGY', 'single_chest_abdomen')
         # Define the required landmarks for each case
         self.shoulder_landmarks = config.get('ROI_LANDMARKS_SHOULDERS', [
@@ -46,7 +50,7 @@ class RoiCalculator:
         self.min_visibility = config.get('POSE_MIN_LANDMARK_VISIBILITY', 0.6) # Default visibility threshold
         self.shoulder_aspect_ratio = config.get('ROI_SHOULDER_ONLY_ASPECT_RATIO', 1.8) # Estimated H/W ratio for shoulder-only case
 
-        print(f"[RoiCalculator] Initialized with Strategy: {self.strategy}")
+        print(f"[CoarseRoiCalculator] Initialized with Strategy: {self.strategy}") # Class name updated in log
         print(f"  Shoulder Landmarks: {[lm.name for lm in self.shoulder_landmarks]}")
         print(f"  Hip Landmarks: {[lm.name for lm in self.hip_landmarks]}")
         print(f"  Padding Factor: {self.padding_factor}, Min Visibility: {self.min_visibility}")
@@ -61,28 +65,28 @@ class RoiCalculator:
 
         for index in landmark_indices:
             try:
-                landmark = landmarks.landmark[index]
+                landmark = landmarks.landmark[index.value] # Access landmark by index value
                 if landmark.visibility >= self.min_visibility:
                     px = int(landmark.x * frame_width)
                     py = int(landmark.y * frame_height)
                     visible_coords[index] = (px, py)
                 else:
-                    # print(f"[RoiCalculator] Debug: Landmark {index.name} visibility {landmark.visibility:.2f} < {self.min_visibility}") # Debug noise
+                    # print(f"[CoarseRoiCalculator] Debug: Landmark {index.name} visibility {landmark.visibility:.2f} < {self.min_visibility}") # Debug noise
                     all_visible = False
-                    # Don't break here, collect all visible ones first
             except IndexError:
-                 print(f"[RoiCalculator] Error: Landmark index {index} out of bounds.")
-                 all_visible = False # Mark as not all visible if index error
+                 print(f"[CoarseRoiCalculator] Error: Landmark index {index.value} out of bounds.")
+                 all_visible = False
             except Exception as e:
-                 print(f"[RoiCalculator] Error accessing landmark {index}: {e}")
-                 all_visible = False # Mark as not all visible on other errors
+                 print(f"[CoarseRoiCalculator] Error accessing landmark {index.name}: {e}")
+                 all_visible = False
 
         return visible_coords, all_visible
 
 
-    def calculate_rois(self, landmarks, frame_shape):
+    # Renamed method
+    def calculate_coarse_roi(self, landmarks, frame_shape):
         """
-        Calculates ROI(s) based on the detected landmarks and configured strategy.
+        Calculates a coarse ROI based on the detected landmarks and configured strategy.
 
         Args:
             landmarks (mediapipe.framework.formats.landmark_pb2.NormalizedLandmarkList):
@@ -92,9 +96,12 @@ class RoiCalculator:
         Returns:
             list: A list of ROI tuples [(x, y, w, h), ...]. Returns an empty list
                   if the required landmarks are not sufficiently visible or calculation fails.
+                  Currently only returns a single ROI or empty list.
         """
         if landmarks is None: return []
-        if not hasattr(landmarks, 'landmark'): print("[RoiCalculator] Invalid landmarks object."); return []
+        if not hasattr(landmarks, 'landmark') or not landmarks.landmark:
+            # print("[CoarseRoiCalculator] Invalid or empty landmarks object.") # Debug noise
+            return []
 
         frame_height, frame_width = frame_shape
         calculated_rois = []
@@ -104,14 +111,13 @@ class RoiCalculator:
             landmarks, self.shoulder_landmarks, frame_shape
         )
         if len(shoulder_coords) != len(self.shoulder_landmarks): # Need both shoulders
-            # print("[RoiCalculator] Not all required shoulder landmarks are sufficiently visible.") # Debug noise
+            # print("[CoarseRoiCalculator] Not all required shoulder landmarks are sufficiently visible.") # Debug noise
             return []
 
         # --- Check Hip Visibility ---
         hip_coords, hips_visible = self._get_visible_landmark_coords(
             landmarks, self.hip_landmarks, frame_shape
         )
-        # We only need *enough* hip coords to determine if the case is degraded or not
         hips_sufficiently_visible = len(hip_coords) == len(self.hip_landmarks)
 
         # --- Calculate ROI based on strategy and visibility ---
@@ -120,93 +126,87 @@ class RoiCalculator:
                 # Get shoulder coordinates
                 left_shoulder = shoulder_coords.get(mp_pose.PoseLandmark.LEFT_SHOULDER)
                 right_shoulder = shoulder_coords.get(mp_pose.PoseLandmark.RIGHT_SHOULDER)
-                # Should always have these if we passed the check above
-                if not left_shoulder or not right_shoulder: return []
+                if not left_shoulder or not right_shoulder: return [] # Should have these
 
                 min_x, max_x, min_y, max_y = 0, 0, 0, 0
 
                 # --- Determine ROI bounds based on visibility ---
                 if hips_sufficiently_visible:
-                    print("[RoiCalculator] Debug: Using Full Case (Shoulders + Hips)")
+                    # print("[CoarseRoiCalculator] Debug: Using Full Case (Shoulders + Hips)") # Debug noise
                     left_hip = hip_coords.get(mp_pose.PoseLandmark.LEFT_HIP)
                     right_hip = hip_coords.get(mp_pose.PoseLandmark.RIGHT_HIP)
-                    if not left_hip or not right_hip: return [] # Should have hips if flag is true
+                    if not left_hip or not right_hip: return [] # Should have hips
 
-                    # Use all four points
                     all_points = [left_shoulder, right_shoulder, left_hip, right_hip]
                     coords_array = np.array(all_points)
                     min_x = np.min(coords_array[:, 0])
                     max_x = np.max(coords_array[:, 0])
-                    min_y = np.min(coords_array[0:2, 1]) # Min Y from shoulders only
-                    max_y = np.max(coords_array[2:4, 1]) # Max Y from hips only
+                    min_y = np.min(coords_array[0:2, 1]) # Shoulders define top
+                    max_y = np.max(coords_array[2:4, 1]) # Hips define bottom
 
                 else: # Degraded Case: Only Shoulders visible
-                    print("[RoiCalculator] Debug: Using Degraded Case (Shoulders Only)")
-                    # Use shoulder points
+                    # print("[CoarseRoiCalculator] Debug: Using Degraded Case (Shoulders Only)") # Debug noise
                     shoulder_points = [left_shoulder, right_shoulder]
                     coords_array = np.array(shoulder_points)
                     min_x = np.min(coords_array[:, 0])
                     max_x = np.max(coords_array[:, 0])
                     min_y = np.min(coords_array[:, 1]) # Top edge is shoulder line
 
-                    # Estimate height based on shoulder width and aspect ratio
                     shoulder_width = max_x - min_x
-                    if shoulder_width <= 0: return [] # Avoid division by zero / invalid width
+                    if shoulder_width <= 0: return []
                     estimated_height = int(shoulder_width * self.shoulder_aspect_ratio)
-                    max_y = min_y + estimated_height # Bottom edge estimated from top
+                    max_y = min_y + estimated_height # Bottom edge estimated
 
                 # --- Calculate Padded ROI from bounds ---
                 roi_w = max_x - min_x
                 roi_h = max_y - min_y
 
                 if roi_w <= 0 or roi_h <= 0:
-                     print(f"[RoiCalculator] Warning: Calculated ROI has zero/negative dimensions before padding (w={roi_w}, h={roi_h}).")
+                     # print(f"[CoarseRoiCalculator] Warning: Calculated ROI has zero/negative dims before padding (w={roi_w}, h={roi_h}).") # Debug noise
                      return []
 
-                # Apply padding
                 center_x = min_x + roi_w / 2
                 center_y = min_y + roi_h / 2
                 padded_w = int(roi_w * self.padding_factor)
                 padded_h = int(roi_h * self.padding_factor)
 
-                # Calculate padded top-left corner
                 padded_x = int(center_x - padded_w / 2)
                 padded_y = int(center_y - padded_h / 2)
 
                 # Clamp coordinates to frame boundaries
                 final_x = max(0, padded_x)
                 final_y = max(0, padded_y)
-                final_w = min(padded_w, frame_width - final_x) # Adjust width based on clamped x
-                final_h = min(padded_h, frame_height - final_y) # Adjust height based on clamped y
+                final_w = min(padded_w, frame_width - final_x)
+                final_h = min(padded_h, frame_height - final_y)
 
-                # Final check for valid dimensions
                 if final_w > 0 and final_h > 0:
                     calculated_rois.append((final_x, final_y, final_w, final_h))
-                else:
-                     print("[RoiCalculator] Warning: ROI dimensions became invalid after padding/clamping.")
+                # else:
+                     # print("[CoarseRoiCalculator] Warning: ROI dimensions became invalid after padding/clamping.") # Debug noise
 
             except Exception as e:
-                print(f"[RoiCalculator] Error during '{self.strategy}' calculation: {e}")
-                traceback.print_exc() # Print stack trace for debugging
-                return [] # Return empty on error
+                print(f"[CoarseRoiCalculator] Error during '{self.strategy}' calculation: {e}")
+                traceback.print_exc()
+                return []
 
-        elif self.strategy == 'multi_chest_abdomen':
-             print("[RoiCalculator] Warning: 'multi_chest_abdomen' strategy not yet implemented.")
-             # TODO: Implement subdivision logic based on the single ROI calculated above
-             pass
+        # --- Placeholder for potential future multi-ROI strategies ---
+        # elif self.strategy == 'multi_chest_abdomen':
+        #      print("[CoarseRoiCalculator] Warning: 'multi_chest_abdomen' strategy not yet implemented.")
+        #      pass
         else:
-            print(f"[RoiCalculator] Error: Unknown ROI strategy '{self.strategy}'")
+            print(f"[CoarseRoiCalculator] Error: Unknown ROI strategy '{self.strategy}'")
             return []
 
         return calculated_rois
 
 
-# Example usage (for testing this module directly)
+# Example usage block (updated class/method names)
 if __name__ == '__main__':
-    print("Testing RoiCalculator module...")
+    print("Testing CoarseRoiCalculator module...") # Updated name
 
-    # --- Create Mock Landmarks ---
-    mock_landmarks = mp_pose.PoseLandmark # Alias
+    # --- Mock Landmarks ---
+    # (Mock landmark setup remains the same as original RoiCalculator test)
+    mock_landmarks = mp_pose.PoseLandmark
     landmarks_data_full = {
         mock_landmarks.LEFT_SHOULDER: {'x': 0.3, 'y': 0.2, 'visibility': 0.9},
         mock_landmarks.RIGHT_SHOULDER: {'x': 0.7, 'y': 0.2, 'visibility': 0.9},
@@ -233,6 +233,7 @@ if __name__ == '__main__':
         def __init__(self, x, y, visibility): self.x, self.y, self.visibility = x, y, visibility
     class MockLandmarkList:
         def __init__(self):
+            # Use max value + 1 for list size
             max_idx = max(lm.value for lm in mp_pose.PoseLandmark)
             self.landmark = [None] * (max_idx + 1)
         def add(self, index, x, y, visibility):
@@ -250,34 +251,37 @@ if __name__ == '__main__':
     frame_shape_test = (480, 640) # height, width
 
     # --- Test Cases ---
-    calculator = RoiCalculator(config={'POSE_MIN_LANDMARK_VISIBILITY': 0.5}) # Use threshold 0.5
+    # Use updated class name
+    calculator = CoarseRoiCalculator(config={'POSE_MIN_LANDMARK_VISIBILITY': 0.5})
 
     print("\n--- Test 1: Full Case (Shoulders + Hips Visible) ---")
-    rois_full = calculator.calculate_rois(mock_pose_landmarks_full, frame_shape_test)
+    # Use updated method name
+    rois_full = calculator.calculate_coarse_roi(mock_pose_landmarks_full, frame_shape_test)
     print(f"Calculated ROIs (full): {rois_full}")
     assert len(rois_full) == 1, "Should calculate one ROI for full case"
     assert rois_full[0][2] > 0 and rois_full[0][3] > 0, "ROI dims should be positive"
 
     print("\n--- Test 2: Degraded Case (Shoulders Only Visible) ---")
-    rois_shoulders = calculator.calculate_rois(mock_pose_landmarks_shoulders, frame_shape_test)
+    # Use updated method name
+    rois_shoulders = calculator.calculate_coarse_roi(mock_pose_landmarks_shoulders, frame_shape_test)
     print(f"Calculated ROIs (shoulders only): {rois_shoulders}")
     assert len(rois_shoulders) == 1, "Should calculate one ROI for shoulders-only case"
     assert rois_shoulders[0][2] > 0 and rois_shoulders[0][3] > 0, "ROI dims should be positive"
-    # Check if height is roughly aspect_ratio * width (allowing for padding/clamping)
     roi_x, roi_y, roi_w, roi_h = rois_shoulders[0]
     expected_ratio = calculator.shoulder_aspect_ratio
     actual_ratio = roi_h / roi_w if roi_w > 0 else 0
     print(f"  Actual H/W Ratio: {actual_ratio:.2f} (Expected ~{expected_ratio})")
-    # assert abs(actual_ratio - expected_ratio) < 0.5, "Height should be estimated based on aspect ratio" # Loose check
 
     print("\n--- Test 3: Failure Case (Shoulders Not Visible) ---")
-    rois_fail = calculator.calculate_rois(mock_pose_landmarks_fail, frame_shape_test)
+    # Use updated method name
+    rois_fail = calculator.calculate_coarse_roi(mock_pose_landmarks_fail, frame_shape_test)
     print(f"Calculated ROIs (no shoulders): {rois_fail}")
     assert len(rois_fail) == 0, "Should calculate zero ROIs when shoulders are not visible"
 
     print("\n--- Test 4: No Landmarks Input ---")
-    rois_none = calculator.calculate_rois(None, frame_shape_test)
+    # Use updated method name
+    rois_none = calculator.calculate_coarse_roi(None, frame_shape_test)
     print(f"Calculated ROIs (None input): {rois_none}")
     assert len(rois_none) == 0, "Should calculate zero ROIs for None input"
 
-    print("\nRoiCalculator module test finished.")
+    print("\nCoarseRoiCalculator module test finished.") # Updated name
