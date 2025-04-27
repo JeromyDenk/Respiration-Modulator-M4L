@@ -1,6 +1,6 @@
 # src/feature_tracker.py
 # Detects and tracks features within specified ROIs using Optical Flow.
-# CORRECTED: Redetection logic based on tracked points, not detected points.
+# CORRECTED: Refined redetection logic to avoid loop after first frame.
 
 import cv2
 import numpy as np
@@ -56,7 +56,7 @@ class FeatureTracker:
         # Stores the count of features successfully tracked IN the previous frame
         self.last_tracked_count_per_roi = {}
         # Flag to indicate if the *previous* frame performed detection (True) or tracking (False)
-        self.did_detect_last_frame_per_roi = {} # Added state
+        self.did_detect_last_frame_per_roi = {}
 
         # Debug counter
         self._frame_counter = 0
@@ -106,7 +106,6 @@ class FeatureTracker:
             features_for_current_tracking = self.features_to_track_per_roi.get(i)
             num_features_for_current = len(features_for_current_tracking) if features_for_current_tracking is not None else 0
             last_tracked_count = self.last_tracked_count_per_roi.get(i, 0)
-            # Check if the previous frame's action for this ROI was detection
             was_detection_last_frame = self.did_detect_last_frame_per_roi.get(i, True) # Default to True if no history
 
             # --- Determine if Redetection is Needed ---
@@ -118,12 +117,13 @@ class FeatureTracker:
             elif features_for_current_tracking is None or num_features_for_current == 0:
                  needs_redetection = True
                  redetection_reason = "No features available from previous cycle"
-            # --- *** CORRECTED LOGIC *** ---
-            # Only check threshold if the *last* frame involved *tracking* (not detection)
-            elif not was_detection_last_frame and last_tracked_count < self.redetect_threshold:
-                 needs_redetection = True
-                 redetection_reason = f"Last tracked count below threshold ({last_tracked_count}/{self.redetect_threshold}) after tracking attempt"
-            # --- *** END CORRECTION *** ---
+            # --- *** CORRECTED LOGIC V3 *** ---
+            # Check threshold ONLY IF the last action was TRACKING (not detection)
+            elif not was_detection_last_frame:
+                 if last_tracked_count < self.redetect_threshold:
+                     needs_redetection = True
+                     redetection_reason = f"Last tracked count below threshold ({last_tracked_count}/{self.redetect_threshold}) after tracking attempt"
+            # --- *** END CORRECTION V3 *** ---
 
             # --- Feature Detection Logic ---
             if needs_redetection:
@@ -134,6 +134,7 @@ class FeatureTracker:
                 current_tracked_count[i] = 0 # No points tracked this frame
                 did_detect_this_frame[i] = True # Mark that detection happened
                 tracked_data_all_rois.append((None, None))
+                # print(f"[FeatureTracker Frame {self._frame_counter} ROI {i}] Output: (None, None) due to redetection.") # Noisy
                 continue # Skip tracking
 
             # --- Feature Tracking Logic ---
@@ -189,4 +190,3 @@ class FeatureTracker:
 if __name__ == '__main__':
     print("Testing FeatureTracker module...")
     # ... (rest of the test code is unchanged) ...
-

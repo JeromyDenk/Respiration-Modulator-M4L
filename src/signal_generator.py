@@ -53,7 +53,7 @@ class SignalGenerator:
             centered_data = displacements - mean_disp
 
             # Check if data is constant (all displacements the same -> zero centered data)
-            if np.allclose(centered_data, 0):
+            if np.allclose(centered_data, 0, atol=1e-6): # Added tolerance
                  # print("[SignalGenerator] Debug PCA: Centered data is all zero (no relative motion)") # Noisy
                  return 0.0, "No relative motion"
 
@@ -61,7 +61,7 @@ class SignalGenerator:
             cov_matrix = np.cov(centered_data, rowvar=False)
 
             # Check if covariance matrix is valid
-            if np.allclose(cov_matrix, 0):
+            if np.allclose(cov_matrix, 0, atol=1e-6): # Added tolerance
                  # print("[SignalGenerator] Debug PCA: Covariance matrix is zero") # Noisy
                  return 0.0, "Zero covariance"
 
@@ -148,7 +148,7 @@ class SignalGenerator:
 
             # --- More Verbose Debugging ---
             # Print status for every frame if signal is zero, otherwise print less often
-            if signal_value == 0.0:
+            if signal_value == 0.0 and reason != "PCA OK (0 pts)": # Don't print if PCA was ok but signal was zero
                  print(f"[SignalGenerator Frame Debug] ROI{i}: Signal=0.0, Reason='{reason}'")
             # elif np.random.rand() < 0.05: # Print non-zero signals occasionally
             #      print(f"[SignalGenerator Frame Debug] ROI{i}: Signal={signal_value:.4f}, Reason='{reason}'")
@@ -195,13 +195,13 @@ if __name__ == '__main__':
     old5 = np.array([[200, 200], [205, 201], [202, 199]], dtype=np.float32)
     new5 = old5.copy()
 
+    # ROI 6: Identical displacements (relative motion is zero)
+    old6 = np.array([[300, 300], [305, 301], [302, 299]], dtype=np.float32)
+    new6 = old6 + np.array([1, 2], dtype=np.float32) # All points moved by (1, 2)
+
 
     tracked_data_list = [
-        (old1, new1),
-        (old2, new2),
-        (old3, new3),
-        (old4, new4),
-        (old5, new5),
+        (old1, new1), (old2, new2), (old3, new3), (old4, new4), (old5, new5), (old6, new6)
     ]
 
     # --- Test Processing ---
@@ -214,10 +214,10 @@ if __name__ == '__main__':
     assert len(signals) == len(tracked_data_list), "Number of signals should match number of ROIs"
     assert signals[0] > 0, "ROI 1 (vertical motion) should produce a positive signal"
     assert signals[1] > 0, "ROI 2 (horizontal motion) should produce a positive signal"
-    # Depending on noise, signal 1 might be larger or smaller than signal 2, hard to assert relative magnitude reliably here.
     assert signals[2] == 0.0, "ROI 3 (not enough points) should produce zero signal"
     assert signals[3] == 0.0, "ROI 4 (no points) should produce zero signal"
-    assert signals[4] == 0.0, "ROI 5 (constant points) should produce zero signal"
+    assert signals[4] == 0.0, "ROI 5 (constant points) should produce zero signal (Reason: No relative motion)"
+    assert signals[5] == 0.0, "ROI 6 (identical displacements) should produce zero signal (Reason: No relative motion)"
 
 
     print("\nSignalGenerator module test finished.")
