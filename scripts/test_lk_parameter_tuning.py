@@ -1,7 +1,7 @@
 # scripts/test_lk_parameter_tuning.py
-# Helps tune FeatureTracker parameters using interactive OpenCV sliders (trackbars)
-# and visualizing tracked points, raw signal, and mean displacement envelope.
-# MODIFIED: Added Mean Displacement Envelope plot, removed motion viz window.
+# Helps tune FeatureTracker and SignalProcessor parameters using interactive OpenCV sliders
+# and visualizing tracked points, raw/filtered signals, and mean displacement envelope.
+# MODIFIED: Re-added Mean Displacement Envelope plot alongside signal tuning sliders. Corrected definitions.
 
 import cv2
 import mediapipe as mp
@@ -51,8 +51,11 @@ except Exception as e: print(f"Warning: Failed to load config '{config_path}': {
 video_config = config.get("video_input", {})
 pose_config = config.get("pose_detector", {})
 coarse_roi_config = config.get("coarse_roi_calculator", {})
-signal_config = config.get("signal_processor", {})
-signal_config.update(config.get("signal_generator", {}))
+# Get base signal config, will be updated by sliders
+# *** Corrected: Define signal_config here ***
+signal_config_base = config.get("signal_processor", {})
+signal_config_base.update(config.get("signal_generator", {}))
+# Get initial feature tracker params from config if available, otherwise use defaults
 initial_ft_config = config.get("feature_tracker", {})
 initial_of_params = initial_ft_config.get("OPTICAL_FLOW_PARAMS", {})
 initial_feat_params = initial_of_params.get("feature_params", {})
@@ -61,36 +64,32 @@ initial_lk_params = initial_of_params.get("lk_params", {})
 CALIBRATION_DURATION_SEC = 5
 
 # Plotting Config
-PLOT_HEIGHT = 120 # Slightly increased plot height
+PLOT_HEIGHT = 100 # Keep plots slightly smaller to fit more
 PLOT_BG_COLOR = (240, 240, 240)
 PLOT_RAW_LINE_COLOR = (100, 100, 100)
-PLOT_MEAN_LINE_COLOR = (200, 0, 0) # Color for mean displacement line
-PLOT_STD_FILL_COLOR = (200, 150, 150) # Color for std dev fill
+PLOT_FILT_LINE_COLOR = (0, 0, 200) # Added back
+PLOT_PEAK_COLOR = (0, 0, 255) # Added back
+# *** Corrected: Define plot colors ***
+PLOT_MEAN_LINE_COLOR = (200, 0, 0)
+PLOT_STD_FILL_COLOR = (200, 150, 150)
 # Font Sizes & Thickness
 FONT_SCALE_INFO = 0.7
 FONT_SCALE_PARAMS = 0.5
 FONT_SCALE_PLOT_TITLE = 0.5
-FONT_SCALE_PLOT_AXIS = 0.4 # Still used in freq plot function if called
+FONT_SCALE_PLOT_AXIS = 0.4
 FONT_THICKNESS = 2
 
 # Window Names & Display Size
-WINDOW_NAME = 'LK Parameter Tuning (Plots)' # Updated main window name
+WINDOW_NAME = 'LK & Signal Parameter Tuning' # Updated main window name
 WEBCAM_DISPLAY_WIDTH = 960
-# Removed Motion Viz constants
 
 DEFAULT_SAMPLING_RATE = 30.0 # Estimate
 MEAN_DISP_HISTORY_SECONDS = 10.0 # Match signal processor buffer for plot length
 
 
 # === PARAMETER SETS TO TEST ===
-# (Parameter sets list remains the same but is not used with sliders)
-lk_criteria_default = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
-parameter_sets = [ # Kept for reference if needed later
-    { 'name': 'Default-ish', 'feature_params': {'maxCorners': 100, 'qualityLevel': 0.3, 'minDistance': 7, 'blockSize': 7}, 'lk_params': {'winSize': (15, 15), 'maxLevel': 2, 'criteria': lk_criteria_default}},
-    # ... (other sets omitted for brevity but should be kept) ...
-    { 'name': 'Stricter LK Criteria', 'feature_params': {'maxCorners': 100, 'qualityLevel': 0.3, 'minDistance': 7, 'blockSize': 7}, 'lk_params': {'winSize': (15, 15), 'maxLevel': 2, 'criteria': (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01)}}
-]
-
+# (Not used with sliders, kept for reference)
+# ...
 
 # --- Plotting Helper Functions ---
 # draw_signal_plot remains unchanged
@@ -112,7 +111,7 @@ def draw_signal_plot(title, signal_buffer, peak_indices, plot_width, plot_height
 # draw_frequency_plot is no longer called, but kept here in case needed later
 # def draw_frequency_plot(...): ...
 
-# --- New Function: Draw Mean Displacement Envelope ---
+# --- *** CORRECTED FUNCTION DEFINITION *** ---
 def draw_mean_displacement_envelope(title, mean_dy_hist, std_dy_hist, plot_width, plot_height, bg_color, mean_color, std_color):
     """Draws the mean vertical displacement and its standard deviation envelope."""
     plot_img = np.full((plot_height, plot_width, 3), bg_color, dtype=np.uint8)
@@ -132,7 +131,6 @@ def draw_mean_displacement_envelope(title, mean_dy_hist, std_dy_hist, plot_width
     lower_bound = mean_dy - std_dy
 
     # Find overall min/max across mean and bounds for normalization
-    # Avoid errors if bounds arrays are empty (shouldn't happen if buffer_len >= 2)
     if lower_bound.size == 0 or upper_bound.size == 0:
          cv2.putText(plot_img, "Calc Error", (10, plot_height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1); return plot_img
     min_val = np.min(lower_bound)
@@ -142,9 +140,7 @@ def draw_mean_displacement_envelope(title, mean_dy_hist, std_dy_hist, plot_width
 
     # Function to normalize y-values
     def normalize_y(y_values):
-        if range_val < 1e-6:
-            # If range is tiny, plot everything near the middle
-            return np.full(len(y_values), plot_height / 2)
+        if range_val < 1e-6: return np.full(len(y_values), plot_height / 2)
         else:
             scale = (plot_height - 2 * padding) / range_val
             normalized = (y_values - min_val) * scale + padding
@@ -158,28 +154,18 @@ def draw_mean_displacement_envelope(title, mean_dy_hist, std_dy_hist, plot_width
     # Generate x coordinates
     x_coords = np.linspace(0, plot_width - 1, buffer_len, dtype=np.int32)
 
-    # Create points for the fill polygon (upper bound then reversed lower bound)
-    # Ensure x_coords matches length of bounds after potential issues
     if len(x_coords) != len(norm_upper) or len(x_coords) != len(norm_lower):
          cv2.putText(plot_img, "Coord Mismatch", (10, plot_height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1); return plot_img
 
     fill_pts = np.vstack((np.column_stack((x_coords, norm_upper)),
                           np.column_stack((x_coords[::-1], norm_lower[::-1]))))
-
-    # Draw the filled standard deviation envelope
     cv2.fillPoly(plot_img, [fill_pts], std_color, lineType=cv2.LINE_AA)
-
-    # Create points for the mean line
     mean_pts = np.column_stack((x_coords, norm_mean)).reshape(-1, 1, 2)
-
-    # Draw the mean line
     cv2.polylines(plot_img, [mean_pts], isClosed=False, color=mean_color, thickness=1, lineType=cv2.LINE_AA)
-
-    # Optional: Draw center line (representing zero displacement)
     center_y_norm = normalize_y(np.array([0.0]))[0] # Normalize zero displacement
     cv2.line(plot_img, (0, int(center_y_norm)), (plot_width - 1, int(center_y_norm)), (150, 150, 150), 1)
-
     return plot_img
+# --- *** END CORRECTED FUNCTION DEFINITION *** ---
 
 
 # --- Initialize Video Input ---
@@ -252,27 +238,34 @@ print("Adjust sliders to tune parameters. Press 's' to SAVE to profile, 'q' to q
 
 # --- Initialize Signal Components ---
 try:
-    signal_generator = SignalGenerator(config=signal_config)
-    signal_processor = SignalProcessor(config=signal_config, sampling_rate=sampling_rate)
+    signal_generator = SignalGenerator(config=signal_config_base) # Use base config here
+    # Initialize signal processor with default/loaded config initially
+    signal_processor = SignalProcessor(config=signal_config_base, sampling_rate=sampling_rate)
 except Exception as e_sig_init: print(f"ERROR initializing signal components: {e_sig_init}"); video_input.release(); sys.exit(1)
 
 # --- Create Window and Trackbars ---
 cv2.namedWindow(WINDOW_NAME)
 def nothing(x): pass # Dummy callback
+# LK Trackbars
 cv2.createTrackbar('maxCorners', WINDOW_NAME, initial_feat_params.get('maxCorners', 100), 300, nothing)
 cv2.createTrackbar('qualityLevel', WINDOW_NAME, int(initial_feat_params.get('qualityLevel', 0.3) * 100), 99, nothing)
 cv2.createTrackbar('minDistance', WINDOW_NAME, initial_feat_params.get('minDistance', 7), 50, nothing)
 win_size_init = initial_lk_params.get('winSize', [15, 15]); win_size_val = win_size_init[0] if isinstance(win_size_init, (list, tuple)) and len(win_size_init) > 0 else 15
 cv2.createTrackbar('winSize', WINDOW_NAME, win_size_val, 51, nothing)
 cv2.createTrackbar('maxLevel', WINDOW_NAME, initial_lk_params.get('maxLevel', 2), 8, nothing)
-# Removed Exaggeration and Trace Decay sliders
+# Signal Processing Trackbars
+cv2.createTrackbar('Filt Low Hz*100', WINDOW_NAME, int(signal_config_base.get('SIGNAL_FILTER_LOW_HZ', 0.1) * 100), 100, nothing)
+cv2.createTrackbar('Filt High Hz*100', WINDOW_NAME, int(signal_config_base.get('SIGNAL_FILTER_HIGH_HZ', 2.0) * 100), 500, nothing)
+initial_prominence = signal_config_base.get('PEAK_DETECT_PROMINENCE')
+if initial_prominence is None: initial_prominence = 0.15 # Default if not set
+cv2.createTrackbar('Peak Prom*1000', WINDOW_NAME, int(initial_prominence * 1000), 4000, nothing)
+
 
 # --- Tuning Loop ---
 prev_time = time.time(); frame_count = 0; feature_tracker = None
-prev_params = {} # Store previous slider values to detect changes
-last_saved_params = {} # Store last saved params to avoid redundant saves
-latest_tracked_old = None # Store points for calculation
-latest_tracked_new = None # Store points for calculation
+prev_lk_params = {} # Store previous LK slider values
+prev_signal_params = {} # Store previous Signal slider values
+last_saved_params = {}
 # --- Deques for Mean Displacement History ---
 mean_disp_history_len = int(MEAN_DISP_HISTORY_SECONDS * sampling_rate)
 mean_dy_history = collections.deque(maxlen=mean_disp_history_len)
@@ -287,48 +280,80 @@ while True: # Loop until user quits or error
     if frame_width == 0 or frame_height == 0: print("Error: Invalid frame dimensions received from VideoInput. Exiting."); break
 
     # --- Read Trackbar Values ---
-    current_params = {
+    current_lk_params = {
         'maxCorners': max(10, cv2.getTrackbarPos('maxCorners', WINDOW_NAME)),
         'qualityLevel': max(1, cv2.getTrackbarPos('qualityLevel', WINDOW_NAME)) / 100.0,
         'minDistance': max(1, cv2.getTrackbarPos('minDistance', WINDOW_NAME)),
         'winSize_raw': cv2.getTrackbarPos('winSize', WINDOW_NAME),
         'maxLevel': cv2.getTrackbarPos('maxLevel', WINDOW_NAME),
-        # Exaggeration removed
     }
-    win_size = max(3, current_params['winSize_raw'] // 2 * 2 + 1)
-    current_params['winSize'] = (win_size, win_size) # Store as tuple for internal use
+    win_size = max(3, current_lk_params['winSize_raw'] // 2 * 2 + 1)
+    current_lk_params['winSize'] = (win_size, win_size)
 
-    # --- Check if LK parameters changed ---
-    params_changed = False
-    compare_keys = ['maxCorners', 'qualityLevel', 'minDistance', 'winSize_raw', 'maxLevel']
-    if not prev_params: params_changed = True
+    current_signal_params = {
+        'filtLow': max(5, cv2.getTrackbarPos('Filt Low Hz*100', WINDOW_NAME)) / 100.0,
+        'filtHigh': max(50, cv2.getTrackbarPos('Filt High Hz*100', WINDOW_NAME)) / 100.0,
+        'prominence': cv2.getTrackbarPos('Peak Prom*1000', WINDOW_NAME) / 1000.0,
+    }
+    if current_signal_params['filtLow'] >= current_signal_params['filtHigh']:
+        current_signal_params['filtLow'] = max(0.01, current_signal_params['filtHigh'] - 0.01)
+
+    # --- Check if parameters changed ---
+    lk_params_changed = False
+    compare_lk_keys = ['maxCorners', 'qualityLevel', 'minDistance', 'winSize_raw', 'maxLevel']
+    if not prev_lk_params: lk_params_changed = True
     else:
-        for key in compare_keys:
-            if current_params[key] != prev_params.get(key): params_changed = True; break
+        for key in compare_lk_keys:
+            if current_lk_params[key] != prev_lk_params.get(key): lk_params_changed = True; break
 
-    # --- Initialize/Re-initialize Feature Tracker if needed ---
-    if feature_tracker is None or params_changed:
-        if params_changed: print(f"\n--- Parameters Changed! Re-initializing Tracker ---")
-        else: print(f"\n--- Initializing Tracker ---")
+    signal_params_changed = False
+    compare_signal_keys = ['filtLow', 'filtHigh', 'prominence']
+    if not prev_signal_params: signal_params_changed = True
+    else:
+         for key in compare_signal_keys:
+              if not np.isclose(current_signal_params[key], prev_signal_params.get(key, -1.0)):
+                   signal_params_changed = True
+                   break
+
+    # --- Initialize/Re-initialize Components if needed ---
+    if feature_tracker is None or lk_params_changed:
+        if lk_params_changed: print(f"\n--- LK Parameters Changed! Re-initializing Tracker & Signal Processor ---")
+        else: print(f"\n--- Initializing Tracker & Signal Processor ---")
         try:
-            # (Tracker config construction remains the same)
-            feature_params_dict = {'maxCorners': current_params['maxCorners'],'qualityLevel': current_params['qualityLevel'],'minDistance': current_params['minDistance'],'blockSize': 7}
-            lk_params_dict = {'winSize': current_params['winSize'],'maxLevel': current_params['maxLevel'],'criteria': (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)}
+            feature_params_dict = {'maxCorners': current_lk_params['maxCorners'],'qualityLevel': current_lk_params['qualityLevel'],'minDistance': current_lk_params['minDistance'],'blockSize': 7}
+            lk_params_dict = {'winSize': current_lk_params['winSize'],'maxLevel': current_lk_params['maxLevel'],'criteria': (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)}
             tracker_config = {'OPTICAL_FLOW_PARAMS': {'feature_params': feature_params_dict,'lk_params': lk_params_dict},'FEATURE_REDETECT_THRESHOLD': int(feature_params_dict.get('maxCorners', 100) * 0.7)}
             feature_tracker = FeatureTracker(config=tracker_config)
-            # Reset signal processor buffers AND mean displacement history
-            signal_processor = SignalProcessor(config=signal_config, sampling_rate=sampling_rate)
-            mean_dy_history.clear()
-            std_dy_history.clear()
+
+            current_sp_config = copy.deepcopy(signal_config_base)
+            current_sp_config['SIGNAL_FILTER_LOW_HZ'] = current_signal_params['filtLow']
+            current_sp_config['SIGNAL_FILTER_HIGH_HZ'] = current_signal_params['filtHigh']
+            current_sp_config['PEAK_DETECT_PROMINENCE'] = current_signal_params['prominence'] if current_signal_params['prominence'] > 1e-6 else None
+            signal_processor = SignalProcessor(config=current_sp_config, sampling_rate=sampling_rate)
+
+            mean_dy_history.clear(); std_dy_history.clear()
             print("   (Signal processor & displacement history buffers reset)")
-            # Store only the relevant params for change detection
-            prev_params = {k: current_params[k] for k in compare_keys}
-            prev_params['winSize'] = current_params['winSize'] # Store processed tuple
-            latest_tracked_old = None
-            latest_tracked_new = None
+            prev_lk_params = {k: current_lk_params[k] for k in compare_lk_keys}; prev_lk_params['winSize'] = current_lk_params['winSize']
+            prev_signal_params = current_signal_params.copy()
+            latest_tracked_old = None; latest_tracked_new = None
 
         except Exception as e_init:
-             print(f"ERROR initializing FeatureTracker: {e_init}"); feature_tracker = None; time.sleep(0.5); continue
+             print(f"ERROR initializing components: {e_init}"); feature_tracker = None; signal_processor = None; time.sleep(0.5); continue
+
+    elif signal_params_changed:
+         print(f"\n--- Signal Parameters Changed! Re-initializing Signal Processor ---")
+         try:
+            current_sp_config = copy.deepcopy(signal_config_base)
+            current_sp_config['SIGNAL_FILTER_LOW_HZ'] = current_signal_params['filtLow']
+            current_sp_config['SIGNAL_FILTER_HIGH_HZ'] = current_signal_params['filtHigh']
+            current_sp_config['PEAK_DETECT_PROMINENCE'] = current_signal_params['prominence'] if current_signal_params['prominence'] > 1e-6 else None
+            signal_processor = SignalProcessor(config=current_sp_config, sampling_rate=sampling_rate)
+            print("   (Signal processor re-initialized, history kept)")
+            prev_signal_params = current_signal_params.copy()
+
+         except Exception as e_init_sp:
+              print(f"ERROR re-initializing SignalProcessor: {e_init_sp}"); signal_processor = None; time.sleep(0.5); continue
+
 
     # --- Performance calculation (FPS) ---
     curr_time = time.time(); fps = 1.0 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0; prev_time = curr_time
@@ -336,44 +361,36 @@ while True: # Loop until user quits or error
     # --- Run Tracking and Signal Pipeline ---
     image_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     tracked_data = []; raw_signals = []
-    latest_tracked_old = None # Reset for this frame
-    latest_tracked_new = None
-    current_mean_dy = 0.0 # Default value
-    current_std_dy = 0.0  # Default value
+    latest_tracked_old = None; latest_tracked_new = None
+    current_mean_dy = 0.0; current_std_dy = 0.0
 
-    if feature_tracker:
+    if feature_tracker and signal_processor:
         try:
             tracked_data = feature_tracker.process_frame(image_gray, static_roi_list)
-            # Store points for displacement calculation
             if tracked_data and tracked_data[0] is not None and tracked_data[0][0] is not None:
                  latest_tracked_old = tracked_data[0][0].copy()
                  latest_tracked_new = tracked_data[0][1].copy()
-
-                 # --- Calculate Mean/Std Vertical Displacement ---
                  if len(latest_tracked_old) > 0:
-                      # Reshape just in case points are (N, 1, 2)
-                      old_pts_flat = latest_tracked_old.reshape(-1, 2)
-                      new_pts_flat = latest_tracked_new.reshape(-1, 2)
-                      displacements = new_pts_flat - old_pts_flat
-                      dy_values = displacements[:, 1] # Get vertical components
-                      current_mean_dy = np.mean(dy_values)
-                      current_std_dy = np.std(dy_values)
-                 # --- End Calculation ---
+                      old_pts_flat = latest_tracked_old.reshape(-1, 2); new_pts_flat = latest_tracked_new.reshape(-1, 2)
+                      displacements = new_pts_flat - old_pts_flat; dy_values = displacements[:, 1]
+                      current_mean_dy = np.mean(dy_values); current_std_dy = np.std(dy_values)
 
             if tracked_data: raw_signals = signal_generator.process_tracked_features(tracked_data)
             else: raw_signals = [0.0] * len(static_roi_list)
             signal_processor.process_signal_values(raw_signals)
         except Exception as e_pipe: print(f"Error during tracking/signal processing: {e_pipe}"); traceback.print_exc()
-    else: signal_processor.process_signal_values([0.0] * len(static_roi_list))
+    elif signal_processor:
+         signal_processor.process_signal_values([0.0] * len(static_roi_list))
 
-    # Append current mean/std to history
     mean_dy_history.append(current_mean_dy)
     std_dy_history.append(current_std_dy)
 
     # --- Gather Results for Display ---
-    bpm, bpm_valid = signal_processor.get_bpm()
-    phase = signal_processor.get_phase()
-    raw_signal_history = signal_processor.get_raw_signal_buffer() # Renamed for clarity
+    bpm, bpm_valid = (0.0, False) if not signal_processor else signal_processor.get_bpm()
+    phase = 0 if not signal_processor else signal_processor.get_phase()
+    raw_signal_history = [] if not signal_processor else signal_processor.get_raw_signal_buffer()
+    filtered_signal_history = [] if not signal_processor else signal_processor.get_filtered_signal_buffer() # Get filtered signal
+    peak_indices = [] if not signal_processor else signal_processor.get_last_peak_indices() # Get peaks
     tracked_points_current = feature_tracker.features_to_track_per_roi.get(0) if feature_tracker else None
 
     # --- Prepare images for drawing ---
@@ -387,11 +404,18 @@ while True: # Loop until user quits or error
 
     # Initialize plot images
     raw_time_plot = np.full((PLOT_HEIGHT, display_w, 3), PLOT_BG_COLOR, dtype=np.uint8)
+    filtered_time_plot = np.full((PLOT_HEIGHT, display_w, 3), PLOT_BG_COLOR, dtype=np.uint8) # Added back
     mean_disp_plot = np.full((PLOT_HEIGHT, display_w, 3), PLOT_BG_COLOR, dtype=np.uint8)
 
     # Generate the plots
     if display_w > 0:
         raw_time_plot = draw_signal_plot(f"Raw Signal (PCA)", raw_signal_history, None, display_w, PLOT_HEIGHT, PLOT_BG_COLOR, PLOT_RAW_LINE_COLOR)
+        # Draw filtered plot
+        filtered_time_plot = draw_signal_plot(
+            f"Filtered Signal (Prom={current_signal_params['prominence']:.3f})",
+            filtered_signal_history, peak_indices, display_w, PLOT_HEIGHT,
+            PLOT_BG_COLOR, PLOT_FILT_LINE_COLOR, PLOT_PEAK_COLOR
+        )
         mean_disp_plot = draw_mean_displacement_envelope(
             "Mean Vertical Displacement +/- StdDev", mean_dy_history, std_dy_history,
             display_w, PLOT_HEIGHT, PLOT_BG_COLOR, PLOT_MEAN_LINE_COLOR, PLOT_STD_FILL_COLOR
@@ -410,31 +434,35 @@ while True: # Loop until user quits or error
             except IndexError: pass
             except Exception as draw_err: print(f"ERROR drawing point {point}: {draw_err}")
     cv2.putText(display_frame, f"FPS: {int(fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE_INFO, (0, 255, 0), FONT_THICKNESS)
-    param_text1 = f"Feat: N={current_params['maxCorners']} Q={current_params['qualityLevel']:.2f} D={current_params['minDistance']}"
-    param_text2 = f"LK: Win={current_params['winSize']} Lvl={current_params['maxLevel']}"
-    # Removed Exaggeration text
+    param_text1 = f"Feat: N={current_lk_params['maxCorners']} Q={current_lk_params['qualityLevel']:.2f} D={current_lk_params['minDistance']}"
+    param_text2 = f"LK: Win={current_lk_params['winSize']} Lvl={current_lk_params['maxLevel']}"
+    # Display current signal params
+    param_text3 = f"Filt: L={current_signal_params['filtLow']:.2f} H={current_signal_params['filtHigh']:.2f}"
+    param_text4 = f"Prom: {current_signal_params['prominence']:.3f}"
     cv2.putText(display_frame, param_text1, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE_PARAMS, (255, 255, 255), 1)
     cv2.putText(display_frame, param_text2, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE_PARAMS, (255, 255, 255), 1)
-    cv2.putText(display_frame, f"Tracked Features: {feature_count}", (10, 105), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE_INFO, (255, 0, 0), FONT_THICKNESS) # Adjusted y-pos
+    cv2.putText(display_frame, param_text3, (10, 100), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE_PARAMS, (255, 255, 255), 1)
+    cv2.putText(display_frame, param_text4, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE_PARAMS, (255, 255, 255), 1)
+    cv2.putText(display_frame, f"Tracked Features: {feature_count}", (10, 145), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE_INFO, (255, 0, 0), FONT_THICKNESS) # Adjusted y-pos
     bpm_text = f"BPM: {bpm:.1f}" if bpm_valid else "BPM: ---"; cv2.putText(display_frame, bpm_text, (display_w - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE_INFO, (0, 255, 255), FONT_THICKNESS)
     phase_map = {signal_processor.PHASE_INHALE: "In", signal_processor.PHASE_EXHALE: "Ex", signal_processor.PHASE_UNKNOWN: "--"}; phase_text = f"P: {phase_map.get(phase, 'Err')}"
     cv2.putText(display_frame, phase_text, (display_w - 200, 60), cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE_INFO, (0, 255, 255), FONT_THICKNESS)
 
     # --- Combine Resized Webcam Frame and Plots ---
     if raw_time_plot.shape[1] != display_w: raw_time_plot = cv2.resize(raw_time_plot, (display_w, PLOT_HEIGHT))
+    if filtered_time_plot.shape[1] != display_w: filtered_time_plot = cv2.resize(filtered_time_plot, (display_w, PLOT_HEIGHT)) # Resize filtered plot
     if mean_disp_plot.shape[1] != display_w: mean_disp_plot = cv2.resize(mean_disp_plot, (display_w, PLOT_HEIGHT))
-    # Stack: Webcam, Raw Signal (PCA), Mean Displacement Envelope
-    combined_display = np.vstack((display_frame, raw_time_plot, mean_disp_plot))
+    # Stack: Webcam, Raw Signal (PCA), Filtered Signal, Mean Displacement Envelope
+    combined_display = np.vstack((display_frame, raw_time_plot, filtered_time_plot, mean_disp_plot))
 
     # --- Display the main frame ---
     cv2.imshow(WINDOW_NAME, combined_display)
 
     # --- Remove Motion Vector Visualization Window ---
-    # Check if the window exists and destroy it if it does
-    # Use the old name here just in case it was left open from a previous run
+    # (Cleanup code remains the same)
     if cv2.getWindowProperty('Velocity Endpoint Trace', cv2.WND_PROP_VISIBLE) >= 1:
         try: cv2.destroyWindow('Velocity Endpoint Trace')
-        except: pass # Ignore error if window already closed
+        except: pass
     if cv2.getWindowProperty('Displacement Vector Traces', cv2.WND_PROP_VISIBLE) >= 1:
          try: cv2.destroyWindow('Displacement Vector Traces')
          except: pass
@@ -444,25 +472,41 @@ while True: # Loop until user quits or error
     key = cv2.waitKey(5) & 0xFF
     if key == ord('q'): print("Exit key pressed."); break
     elif key == ord('s'): # Save parameters
-        # (Save logic remains the same)
+        # --- Modify Save Logic to include Signal Params ---
         print("\n--- Saving current parameters ---")
         try:
-            feat_params_to_save = {'maxCorners': current_params['maxCorners'],'qualityLevel': current_params['qualityLevel'],'minDistance': current_params['minDistance'],'blockSize': 7}
-            lk_params_to_save = {'winSize': list(current_params['winSize']),'maxLevel': current_params['maxLevel'],'criteria': [3, 10, 0.03]}
+            # LK Params
+            feat_params_to_save = {'maxCorners': current_lk_params['maxCorners'],'qualityLevel': current_lk_params['qualityLevel'],'minDistance': current_lk_params['minDistance'],'blockSize': 7}
+            lk_params_to_save = {'winSize': list(current_lk_params['winSize']),'maxLevel': current_lk_params['maxLevel'],'criteria': [3, 10, 0.03]}
             redetect_thresh = int(feat_params_to_save['maxCorners'] * 0.7)
+            # Signal Params
+            signal_params_to_save = {
+                'SIGNAL_FILTER_LOW_HZ': current_signal_params['filtLow'],
+                'SIGNAL_FILTER_HIGH_HZ': current_signal_params['filtHigh'],
+                'PEAK_DETECT_PROMINENCE': current_signal_params['prominence'] if current_signal_params['prominence'] > 1e-6 else None
+            }
+
             current_full_config = {};
             try:
                 with open(config_path, 'r') as f_read: current_full_config = json.load(f_read)
             except FileNotFoundError: print(f"Warning: Profile '{PROFILE_FILENAME}' not found for loading, creating new structure.")
             except Exception as e_load: print(f"Warning: Error loading profile '{PROFILE_FILENAME}' for saving: {e_load}. Saving may overwrite structure.")
+
+            # Update feature tracker section
             if "feature_tracker" not in current_full_config: current_full_config["feature_tracker"] = {}
             if "OPTICAL_FLOW_PARAMS" not in current_full_config["feature_tracker"]: current_full_config["feature_tracker"]["OPTICAL_FLOW_PARAMS"] = {}
             current_full_config["feature_tracker"]["OPTICAL_FLOW_PARAMS"]["feature_params"] = feat_params_to_save
             current_full_config["feature_tracker"]["OPTICAL_FLOW_PARAMS"]["lk_params"] = lk_params_to_save
             current_full_config["feature_tracker"]["FEATURE_REDETECT_THRESHOLD"] = redetect_thresh
+
+            # Update signal processor section
+            if "signal_processor" not in current_full_config: current_full_config["signal_processor"] = {}
+            current_full_config["signal_processor"].update(signal_params_to_save) # Update with new values
+
             with open(config_path, 'w') as f_write: json.dump(current_full_config, f_write, indent=2)
             print(f"Parameters saved to: {config_path}")
-            last_saved_params = current_params.copy()
+            last_saved_params = {**current_lk_params, **current_signal_params} # Update last saved
+
         except Exception as e_save: print(f"ERROR saving parameters to {config_path}: {e_save}"); traceback.print_exc()
 
 # --- Cleanup ---
