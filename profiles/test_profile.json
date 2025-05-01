@@ -48,7 +48,7 @@
           31,
           31
         ],
-        "maxLevel": 2,
+        "maxLevel": 3,
         "criteria": [
           3,
           10,
@@ -60,7 +60,8 @@
   },
   "signal_generator": {
     "SIGNAL_MIN_FEATURES_FOR_PCA": 3,
-    "SIGNAL_PCA_METHOD": "numpy"
+    "SIGNAL_PCA_METHOD": "numpy",
+    "SIGNAL_AGGREGATION_METHOD": "median"
   },
   "signal_processor": {
     "SIGNAL_BUFFER_SECONDS": 10.0,
@@ -68,13 +69,15 @@
     "SIGNAL_FILTER_METHOD": "lfilter",
     "SIGNAL_FILTER_TYPE": "butterworth",
     "SIGNAL_FILTER_ORDER": 2,
-    "SIGNAL_FILTER_LOW_HZ": 0.1,
-    "SIGNAL_FILTER_HIGH_HZ": 2.0,
+    "SIGNAL_FILTER_LOW_HZ": 0.05,
+    "SIGNAL_FILTER_HIGH_HZ": 0.61,
     "PEAK_DETECT_MIN_HEIGHT": 0.0,
     "PEAK_DETECT_MIN_DISTANCE_SEC": 0.5,
-    "PEAK_DETECT_PROMINENCE": null,
+    "PEAK_DETECT_PROMINENCE": 0.599,
     "BPM_AVERAGING_SECONDS": 5.0,
-    "PHASE_SLOPE_WINDOW_MS": 100
+    "PHASE_SLOPE_WINDOW_MS": 100,
+    "SIGNAL_MIN_FEATURES_FOR_SIGNAL": 0,
+    "SIGNAL_AGGREGATION_METHOD": "median"
   },
   "osc_sender": {
     "OSC_IP_ADDRESS": "127.0.0.1",

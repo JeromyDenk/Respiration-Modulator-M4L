@@ -1,34 +1,31 @@
 # src/pipeline_manager.py
-# Orchestrates the different processing phases (pose, roi, tracking, signal gen, signal proc).
-# Manages state like current ROI and recalibration triggers.
-# CORRECTED: Reset FeatureTracker only when ROI was previously lost/invalid or on manual trigger.
+# Orchestrates the different processing phases.
+# Includes logic for periodic recalibration using Pose and Coarse ROI.
+# REMOVED: All EVM-related functionality.
 
 import cv2
 import numpy as np
 import time
 import traceback
-import collections # Added for deque
+import collections # For deque (still potentially useful for other buffering if needed)
 
 # Import necessary modules from src
 try:
     from pose_detector import PoseDetector
-    # IMPORTANT: Assumes roi_calculator.py has been renamed to coarse_roi_calculator.py
-    # and the class inside renamed to CoarseRoiCalculator
-    from coarse_roi_calculator import CoarseRoiCalculator
+    from coarse_roi_calculator import CoarseRoiCalculator # Use the renamed class
     from feature_tracker import FeatureTracker
     from signal_generator import SignalGenerator
     from signal_processor import SignalProcessor
-    from evm_processor import EvmProcessor # Import the EVM processor
+    # from evm_processor import EvmProcessor # Removed EVM import
 except ImportError as e:
-    print(f"PipelineManager Error: Failed to import sub-modules. "
-          f"Ensure they exist and RoiCalculator has been renamed: {e}")
+    print(f"PipelineManager Error: Failed to import sub-modules: {e}")
     raise
 
 class PipelineManager:
     """
     Orchestrates the respiration monitoring pipeline, managing state and
     coordinating the processing modules. Includes logic to run expensive
-    pose/ROI detection periodically and uses EvmProcessor for ROI refinement.
+    pose/ROI detection periodically. EVM functionality has been removed.
     """
     def __init__(self, config, sampling_rate):
         """
@@ -36,7 +33,7 @@ class PipelineManager:
 
         Args:
             config (dict): The main configuration dictionary for the application.
-                           Expects EVM_* parameters if EVM is enabled.
+                           Expects nested sections like "pose_detector", etc.
             sampling_rate (float): The processing rate (e.g., video FPS).
         """
         print("[PipelineManager] Initializing...")
@@ -45,62 +42,58 @@ class PipelineManager:
         if self.sampling_rate <= 0:
             raise ValueError("PipelineManager requires a positive sampling_rate.")
 
-        # --- Configuration ---
-        self.pose_detection_interval = max(1, config.get('POSE_DETECTION_FRAME_INTERVAL', 1))
-        self.recalibration_interval_sec = config.get('PIPELINE_RECALIBRATION_INTERVAL_SEC', 300)
-        self.evm_enabled = config.get('evm_processor', {}).get('EVM_ENABLED', False) # Check nested dict
-        self.evm_buffer_seconds = config.get('evm_processor', {}).get('EVM_BUFFER_SECONDS', 2.0)
-        self.evm_buffer_size = int(self.evm_buffer_seconds * self.sampling_rate)
+        # --- Configuration Extraction ---
+        pipeline_cfg = config.get('pipeline_manager', {})
+        pose_cfg = config.get('pose_detector', {})
+        coarse_roi_cfg = config.get('coarse_roi_calculator', {})
+        feature_cfg = config.get('feature_tracker', {})
+        signal_gen_cfg = config.get('signal_generator', {})
+        signal_proc_cfg = config.get('signal_processor', {})
+        # evm_cfg = config.get('evm_processor', {}) # Removed EVM config extraction
+
+        self.pose_detection_interval = max(1, pipeline_cfg.get('POSE_DETECTION_FRAME_INTERVAL', 1))
+        self.recalibration_interval_sec = pipeline_cfg.get('PIPELINE_RECALIBRATION_INTERVAL_SEC', 300) # 5 minutes default
+        # Removed EVM related config variables
+        # self.evm_enabled = evm_cfg.get('EVM_ENABLED', False)
+        # self.evm_buffer_seconds = evm_cfg.get('EVM_BUFFER_SECONDS', 2.0)
+        # self.evm_buffer_size = int(self.evm_buffer_seconds * self.sampling_rate) if self.sampling_rate > 0 else 0
 
         # --- Initialize Processing Modules ---
         try:
-            self.pose_detector = PoseDetector(config=config.get("pose_detector", {}))
-            # Use the renamed class
-            self.coarse_roi_calculator = CoarseRoiCalculator(config=config.get("coarse_roi_calculator", {}))
-            self.feature_tracker = FeatureTracker(config=config.get("feature_tracker", {}))
-            self.signal_generator = SignalGenerator(config=config.get("signal_generator", {}))
-            self.signal_processor = SignalProcessor(config=config.get("signal_processor", {}), sampling_rate=self.sampling_rate)
-            # Initialize EVM processor only if enabled
-            self.evm_processor = EvmProcessor(config=config.get("evm_processor", {}), sampling_rate=self.sampling_rate) if self.evm_enabled else None
-
-            if self.evm_enabled and self.evm_processor:
-                 print("[PipelineManager] EVM Processor Enabled and Initialized.")
-            elif self.evm_enabled and not self.evm_processor:
-                 print("[PipelineManager] Warning: EVM_ENABLED is true but EvmProcessor failed to initialize.")
-                 self.evm_enabled = False # Disable if init failed
-            else:
-                 print("[PipelineManager] EVM Processor Disabled.")
-
-            print("[PipelineManager] Core processing modules initialized.")
+            self.pose_detector = PoseDetector(config=pose_cfg)
+            self.coarse_roi_calculator = CoarseRoiCalculator(config=coarse_roi_cfg)
+            self.feature_tracker = FeatureTracker(config=feature_cfg)
+            self.signal_generator = SignalGenerator(config=signal_gen_cfg)
+            self.signal_processor = SignalProcessor(config=signal_proc_cfg, sampling_rate=self.sampling_rate)
+            # self.evm_processor = None # Removed EVM processor instance
+            print("[PipelineManager] Core processing modules initialized (EVM Disabled).")
         except Exception as e:
             print(f"[PipelineManager] FATAL ERROR initializing processing modules: {e}")
             traceback.print_exc()
             raise RuntimeError("Failed to initialize one or more processing modules.") from e
 
         # --- Internal State ---
-        self.current_rois = [] # This will store the *refined* ROI if EVM is used, otherwise the coarse one
+        self.current_rois = [] # Stores the active ROI(s) from CoarseRoiCalculator
         self.last_landmarks = None
         self.needs_recalibration = True
         self.last_frame_time = time.time()
         self.frame_count = 0
         self.last_recalibration_time = 0
-        # Frame buffer for EVM (stores full grayscale frames)
-        self.grayscale_frame_buffer = collections.deque(maxlen=self.evm_buffer_size) if self.evm_enabled else None
+        # self.grayscale_frame_buffer = None # Removed EVM frame buffer
 
         print(f"[PipelineManager] Pose detection interval: {self.pose_detection_interval} frame(s).")
-        if self.evm_enabled:
-            print(f"[PipelineManager] EVM frame buffer size: {self.evm_buffer_size} frames (~{self.evm_buffer_seconds:.1f}s).")
+        print(f"[PipelineManager] Recalibration time interval: {self.recalibration_interval_sec} sec.")
 
 
     def trigger_recalibration(self):
-        """Sets a flag to force pose/ROI/EVM recalculation on the next frame."""
+        """Sets a flag to force pose/ROI recalculation on the next frame."""
         print("[PipelineManager] Recalibration triggered externally.")
         self.needs_recalibration = True
 
-    def _should_run_recalibration(self): # Renamed for clarity
-        """Determines if pose/ROI/EVM recalculation should run on the current frame."""
+    def _should_run_recalibration(self):
+        """Determines if pose/ROI recalculation should run on the current frame."""
         if self.needs_recalibration: return True
-        if not self.current_rois: return True # Always run if no ROI
+        if not self.current_rois: return True
         if self.pose_detection_interval > 1 and self.frame_count % self.pose_detection_interval == 0: return True
         if self.recalibration_interval_sec > 0 and \
            time.time() - self.last_recalibration_time > self.recalibration_interval_sec:
@@ -108,55 +101,23 @@ class PipelineManager:
             return True
         return False
 
-    # --- ADDED HELPER METHOD ---
-    def _rois_are_different(self, rois1, rois2, tolerance=1):
-        """Helper to compare two lists of ROI tuples with a tolerance."""
+    # Removed _get_buffered_coarse_roi_frames helper function
+
+    def _rois_are_different(self, rois1, rois2, threshold=5):
+        """Helper to check if two lists of ROIs are significantly different."""
         if len(rois1) != len(rois2):
             return True
-        for r1, r2 in zip(rois1, rois2):
-            # Compare x, y, w, h within tolerance
-            if abs(r1[0] - r2[0]) > tolerance or \
-               abs(r1[1] - r2[1]) > tolerance or \
-               abs(r1[2] - r2[2]) > tolerance or \
-               abs(r1[3] - r2[3]) > tolerance:
-                return True
-        return False # ROIs are considered the same
-    # --- END ADDED HELPER METHOD ---
-
-    def _get_buffered_coarse_roi_frames(self, coarse_roi):
-        """Extracts and crops frames from the buffer for the given coarse ROI."""
-        if not self.grayscale_frame_buffer or self.evm_processor is None or len(self.grayscale_frame_buffer) < self.evm_processor.min_buffer_frames:
-            # print("[PipelineManager] Debug: EVM frame buffer too short.") # Debug noise
-            return None
-
-        x, y, w, h = coarse_roi
-        cropped_frames = collections.deque(maxlen=self.evm_buffer_size)
-        try:
-            for frame in self.grayscale_frame_buffer:
-                # Ensure ROI coordinates are valid for the frame shape
-                frame_h, frame_w = frame.shape
-                x1, y1 = max(0, x), max(0, y)
-                x2, y2 = min(frame_w, x + w), min(frame_h, y + h)
-                if x1 >= x2 or y1 >= y2:
-                    print(f"[PipelineManager] Warning: Coarse ROI {coarse_roi} invalid for frame shape {frame.shape}")
-                    return None # Cannot crop
-                cropped_frames.append(frame[y1:y2, x1:x2])
-
-            # Check if we actually got enough frames after potential cropping issues
-            if len(cropped_frames) < self.evm_processor.min_buffer_frames:
-                 # print(f"[PipelineManager] Debug: Not enough valid cropped frames ({len(cropped_frames)}/{self.evm_processor.min_buffer_frames}).") # Debug noise
-                 return None
-
-            return cropped_frames
-        except Exception as e:
-            print(f"[PipelineManager] Error cropping frames for EVM buffer: {e}")
-            return None
-
+        if not rois1: # Both are empty
+            return False
+        r1 = np.array(rois1[0])
+        r2 = np.array(rois2[0])
+        if np.any(np.abs(r1 - r2) > threshold):
+            return True
+        return False
 
     def process_frame(self, frame):
         """
-        Processes a single video frame through the entire pipeline.
-        Uses EVM for ROI refinement if enabled.
+        Processes a single video frame through the entire pipeline (Pose -> ROI -> Track -> Signal).
 
         Args:
             frame (np.ndarray): The input video frame (BGR format).
@@ -172,30 +133,25 @@ class PipelineManager:
         self.frame_count += 1
         frame_height, frame_width = frame.shape[:2]
 
-        # --- 1. Input Conversion & Buffering ---
+        # --- 1. Input Conversion ---
         try:
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             image_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            image_rgb.flags.writeable = False
-            # Add current frame to EVM buffer if enabled
-            if self.evm_enabled and self.grayscale_frame_buffer is not None:
-                self.grayscale_frame_buffer.append(image_gray.copy()) # Store copy
+            image_rgb.flags.writeable = False # Performance hint for MediaPipe
+            # No EVM buffer needed
         except cv2.error as e_cvt:
              print(f"[PipelineManager] Error converting frame colorspace: {e_cvt}")
-             return None
-        except Exception as e_buf:
-            print(f"[PipelineManager] Error adding frame to buffer: {e_buf}")
-            # Continue processing if possible, EVM might fail later
+             return None # Critical error
 
-        # --- 2. Recalibration Logic (Pose -> Coarse ROI -> Optional EVM Refinement) ---
+        # --- 2. Recalibration Logic (Pose -> Coarse ROI) ---
         run_recalibration = self._should_run_recalibration()
-        recalibration_succeeded = False # Track if ROI was successfully updated (refined or coarse)
+        recalibration_succeeded = False # Track if ROI was successfully updated this frame
         pose_succeeded = False
         reset_tracker_needed = False
 
         was_forced_recalibration = self.needs_recalibration
         roi_was_missing = not self.current_rois
-        new_roi_for_this_cycle = [] # Store the ROI determined in this cycle
+        new_roi_for_this_cycle = []
 
         if run_recalibration:
             print(f"[PipelineManager] Running Recalibration (Frame {self.frame_count})...")
@@ -203,72 +159,40 @@ class PipelineManager:
             if landmarks:
                 pose_succeeded = True
                 self.last_landmarks = landmarks
-                # Calculate the coarse ROI first
+                # Calculate the coarse ROI directly
                 coarse_roi_list = self.coarse_roi_calculator.calculate_coarse_roi(landmarks, (frame_height, frame_width))
 
                 if coarse_roi_list:
-                    coarse_roi = coarse_roi_list[0] # Assume single coarse ROI for now
-                    print(f"[PipelineManager]   Coarse ROI calculated: {coarse_roi}")
-
-                    # --- EVM Refinement Step (if enabled) ---
-                    if self.evm_enabled and self.evm_processor:
-                        print("[PipelineManager]   Attempting EVM ROI refinement...")
-                        evm_buffer = self._get_buffered_coarse_roi_frames(coarse_roi)
-                        if evm_buffer:
-                            # EVM processor now returns ROI list and variance map
-                            refined_roi_list, variance_map = self.evm_processor.find_optimal_roi(evm_buffer, coarse_roi)
-                            if refined_roi_list:
-                                print(f"[PipelineManager]   EVM Refinement successful: {refined_roi_list}")
-                                new_roi_for_this_cycle = refined_roi_list
-                                recalibration_succeeded = True
-                            else:
-                                print("[PipelineManager]   EVM Refinement failed. Falling back to coarse ROI.")
-                                new_roi_for_this_cycle = coarse_roi_list # Fallback
-                                recalibration_succeeded = True # Still succeeded in getting *a* ROI
-                        else:
-                             print("[PipelineManager]   EVM buffer not ready or cropping failed. Falling back to coarse ROI.")
-                             new_roi_for_this_cycle = coarse_roi_list # Fallback
-                             recalibration_succeeded = True # Still succeeded in getting *a* ROI
-                    else:
-                        # EVM not enabled, use coarse ROI directly
-                        new_roi_for_this_cycle = coarse_roi_list
-                        recalibration_succeeded = True
-
+                    print(f"[PipelineManager]   Coarse ROI calculated: {coarse_roi_list}")
+                    new_roi_for_this_cycle = coarse_roi_list
+                    recalibration_succeeded = True
                 else: # Coarse ROI calculation failed
                     print("[PipelineManager]   Coarse ROI calculation failed.")
-                    if was_forced_recalibration or roi_was_missing:
-                        if self.current_rois: reset_tracker_needed = True
-                        self.current_rois = []
-                        self.needs_recalibration = True
-                    else: self.needs_recalibration = False
-
+                    # Keep recalibration_succeeded as False
             else: # Pose detection failed
                 print("[PipelineManager]   Pose detection failed.")
                 self.last_landmarks = None
+                # Keep recalibration_succeeded as False
+
+            # --- Update State based on Recalibration Outcome ---
+            if recalibration_succeeded:
+                if self._rois_are_different(new_roi_for_this_cycle, self.current_rois):
+                     print(f"[PipelineManager]   ROI changed. Resetting tracker.")
+                     reset_tracker_needed = True
+                     self.current_rois = new_roi_for_this_cycle
+                self.needs_recalibration = False
+                self.last_recalibration_time = time.time()
+            else: # Recalibration failed
                 if was_forced_recalibration or roi_was_missing:
                     if self.current_rois: reset_tracker_needed = True
                     self.current_rois = []
                     self.needs_recalibration = True
-                else: self.needs_recalibration = False
-
-            # --- Update State and Check for Tracker Reset ---
-            if recalibration_succeeded:
-                # Check if tracker needs reset ONLY if forced or recovering from missing ROI
-                if was_forced_recalibration or roi_was_missing:
-                    # Only reset if the new ROI is actually different from the (potentially empty) old one
-                    if self._rois_are_different(new_roi_for_this_cycle, self.current_rois): # Use the helper method
-                         print(f"[PipelineManager]   Forced recalibration/recovery successful. ROI changed. Resetting tracker.")
-                         reset_tracker_needed = True
-
-                self.current_rois = new_roi_for_this_cycle # Update the current ROI
-                self.needs_recalibration = False # Reset trigger
-                self.last_recalibration_time = time.time()
+                # else: Periodic check failed, keep old ROI
 
             # Reset tracker if flagged
             if reset_tracker_needed:
                 print("[PipelineManager] Re-initializing FeatureTracker state.")
-                self.feature_tracker = FeatureTracker(config=self.config.get("feature_tracker", {})) # Pass relevant config
-
+                self.feature_tracker = FeatureTracker(config=self.config.get('feature_tracker', {}))
 
         # --- 3. Feature Tracking ---
         tracked_data = []
@@ -289,9 +213,6 @@ class PipelineManager:
                  print(f"[PipelineManager] Error during signal generation: {e_siggen}")
                  traceback.print_exc()
                  raw_signals = [0.0] * len(tracked_data)
-        else:
-             raw_signals = [0.0] * len(self.current_rois)
-
 
         # --- 5. Signal Processing ---
         try:
@@ -314,14 +235,15 @@ class PipelineManager:
             'bpm': bpm,
             'bpm_valid': bpm_valid,
             'phase': phase,
-            'current_rois': self.current_rois, # This is the refined ROI if EVM used
+            'current_rois': self.current_rois, # ROI from CoarseRoiCalculator
             'landmarks': self.last_landmarks,
             'filtered_signal_history': filtered_signal_history,
             'raw_signal_history': raw_signal_history,
             'peak_indices': peak_indices,
             'processing_time': processing_time,
-            'recalibrated_this_frame': recalibration_succeeded, # ROI successfully calculated/checked
-            'pose_run_attempted': run_recalibration, # If pose step was entered
+            'recalibration_run_this_frame': run_recalibration,
+            'recalibration_succeeded': recalibration_succeeded,
+            # 'evm_refined_roi': False, # Removed EVM flag
             'frame_count': self.frame_count
         }
 
@@ -332,8 +254,5 @@ class PipelineManager:
         print("[PipelineManager] Closing pipeline...")
         if hasattr(self, 'pose_detector') and self.pose_detector:
             self.pose_detector.close()
-        # Add close methods for other components if needed
         print("[PipelineManager] Pipeline closed.")
-
-# (Example usage block remains the same conceptually)
 

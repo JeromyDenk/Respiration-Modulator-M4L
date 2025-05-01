@@ -1,0 +1,88 @@
+{
+    "profile_name": "Test Profile with EVM Enabled",
+    "description": "Configuration for testing the pipeline with default settings, Nth frame pose detection, and EVM refinement enabled.",
+  
+    "pipeline_manager": {
+      "POSE_DETECTION_FRAME_INTERVAL": 30,
+      "PIPELINE_RECALIBRATION_INTERVAL_SEC": 300
+    },
+  
+    "pose_detector": {
+      "POSE_MODEL_COMPLEXITY": 0,
+      "POSE_STATIC_IMAGE_MODE": false,
+      "POSE_MIN_DETECTION_CONFIDENCE": 0.5,
+      "POSE_MIN_TRACKING_CONFIDENCE": 0.5
+    },
+  
+    "coarse_roi_calculator": {
+      "ROI_STRATEGY": "single_chest_abdomen",
+      "ROI_PADDING_FACTOR": 1.05,
+      "POSE_MIN_LANDMARK_VISIBILITY": 0.6,
+      "ROI_SHOULDER_ONLY_ASPECT_RATIO": 1.8
+    },
+  
+    "evm_processor": {
+      "EVM_ENABLED": true,
+      "EVM_BUFFER_SECONDS": 2.0,
+      "EVM_REFINED_ROI_SIZE_FACTOR": 0.3,
+      "EVM_MIN_BUFFER_FRAMES": 15,
+      "EVM_ROI_SCORING_METHOD": "pixel_variance",
+      "EVM_PYRAMID_LEVELS": 4,
+      "EVM_TEMPORAL_FILTER_LOW_HZ": 0.1,
+      "EVM_TEMPORAL_FILTER_HIGH_HZ": 2.0,
+      "EVM_ALPHA": 50,
+      "EVM_ROI_SELECTION_LEVEL": 3
+    },
+  
+    "feature_tracker": {
+      "OPTICAL_FLOW_PARAMS": {
+        "feature_params": {
+          "maxCorners": 100,
+          "qualityLevel": 0.3,
+          "minDistance": 7,
+          "blockSize": 7
+        },
+        "lk_params": {
+          "winSize": [15, 15],
+          "maxLevel": 2,
+          "criteria": [3, 10, 0.03]
+        }
+      },
+      "FEATURE_REDETECT_THRESHOLD": 30
+    },
+  
+    "signal_generator": {
+      "SIGNAL_MIN_FEATURES_FOR_PCA": 3,
+      "SIGNAL_PCA_METHOD": "numpy"
+    },
+  
+    "signal_processor": {
+      "SIGNAL_BUFFER_SECONDS": 10.0,
+      "SIGNAL_FUSION_STRATEGY": "first",
+      "SIGNAL_FILTER_METHOD": "lfilter",
+      "SIGNAL_FILTER_TYPE": "butterworth",
+      "SIGNAL_FILTER_ORDER": 2,
+      "SIGNAL_FILTER_LOW_HZ": 0.1,
+      "SIGNAL_FILTER_HIGH_HZ": 2.0,
+      "PEAK_DETECT_MIN_HEIGHT": 0.0,
+      "PEAK_DETECT_MIN_DISTANCE_SEC": 0.5,
+      "PEAK_DETECT_PROMINENCE": null,
+      "BPM_AVERAGING_SECONDS": 5.0,
+      "PHASE_SLOPE_WINDOW_MS": 100
+    },
+  
+    "osc_sender": {
+      "OSC_IP_ADDRESS": "127.0.0.1",
+      "OSC_PORT": 8888,
+      "OSC_BPM_ADDRESS": "/respiration/bpm",
+      "OSC_PHASE_ADDRESS": "/respiration/phase",
+      "OSC_VALIDITY_ADDRESS": "/respiration/valid"
+    },
+  
+    "ui": {
+        "MATPLOTLIB_UI_ENABLED": true,
+        "PLOT_UPDATE_INTERVAL_MS": 100
+    }
+  
+  }
+  

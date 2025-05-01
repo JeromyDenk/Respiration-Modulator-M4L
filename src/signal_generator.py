@@ -1,17 +1,17 @@
 # src/signal_generator.py
-# Phase 3: Calculates motion signal(s) from tracked feature flow vectors using PCA.
-# ADDED: More specific debug prints for zero signal cases.
+# Phase 3: Calculates motion signal(s) from tracked feature flow vectors.
+# MODIFIED: Calculates signal based on mean OR median vertical displacement,
+#           configurable via 'SIGNAL_AGGREGATION_METHOD'. Defaults to median.
 
 import numpy as np
 import traceback
-# Optional: Use scikit-learn for PCA if available and preferred.
+# Optional: PCA related imports removed or commented out
 # from sklearn.decomposition import PCA
-# If using sklearn, add it to requirements.txt
 
 class SignalGenerator:
     """
     Calculates a raw motion signal for each ROI based on the displacement
-    of tracked features, using PCA to find the principal axis of motion.
+    of tracked features, using either the mean or median vertical displacement.
     """
     def __init__(self, config=None):
         """
@@ -19,74 +19,49 @@ class SignalGenerator:
 
         Args:
             config (dict, optional): Configuration dictionary. Expected keys:
-                'SIGNAL_MIN_FEATURES_FOR_PCA' (int): Minimum tracked features needed for PCA.
-                'SIGNAL_PCA_METHOD' (str): 'numpy' or 'sklearn' (if sklearn is used).
+                'SIGNAL_MIN_FEATURES_FOR_SIGNAL' (int): Min features for calculation.
+                'SIGNAL_AGGREGATION_METHOD' (str): 'mean' or 'median' (default 'median').
                 Defaults are used if config is None or keys are missing.
         """
         if config is None:
             config = {}
 
-        # Minimum number of valid displacement vectors required to run PCA
-        self.min_features_for_pca = config.get('SIGNAL_MIN_FEATURES_FOR_PCA', 3) # Need at least 2 for variance, 3 is safer
-        self.pca_method = config.get('SIGNAL_PCA_METHOD', 'numpy') # Default to numpy implementation
+        # Minimum number of valid displacement vectors required for calculation
+        self.min_features_for_signal = config.get('SIGNAL_MIN_FEATURES_FOR_SIGNAL',
+                                                  config.get('SIGNAL_MIN_FEATURES_FOR_PCA', 3)) # Fallback for old key name
 
-        # Optional: Initialize sklearn PCA if chosen
-        # if self.pca_method == 'sklearn':
-        #     self.pca = PCA(n_components=1) # We only need the first principal component
+        # --- NEW: Configuration for aggregation method ---
+        self.aggregation_method = config.get('SIGNAL_AGGREGATION_METHOD', 'median').lower()
+        if self.aggregation_method not in ['mean', 'median']:
+            print(f"[SignalGenerator] Warning: Invalid SIGNAL_AGGREGATION_METHOD '{self.aggregation_method}'. Defaulting to 'median'.")
+            self.aggregation_method = 'median'
 
-        print("[SignalGenerator] Initialized.")
-        print(f"  Min Features for PCA: {self.min_features_for_pca}")
-        print(f"  PCA Method: {self.pca_method}")
+        print(f"[SignalGenerator] Initialized (Using {self.aggregation_method.capitalize()} Vertical Displacement).") # Updated message
+        print(f"  Min Features for Signal Calc: {self.min_features_for_signal}")
+        print(f"  Aggregation Method: {self.aggregation_method}")
 
 
+    # --- PCA calculation method is no longer directly used by default ---
+    # Kept here for reference or if you want to add a switch later
     def _calculate_pca_signal_numpy(self, displacements):
         """Calculates signal using PCA manually with NumPy."""
         num_displacements = displacements.shape[0]
-        if num_displacements < self.min_features_for_pca:
-            # This case is handled before calling, but double-check
-            # print(f"[SignalGenerator] Debug PCA: Not enough features ({num_displacements})") # Noisy
+        if num_displacements < self.min_features_for_signal:
             return 0.0, "Too few points for PCA"
-
         try:
-            # Center the data (subtract the mean)
             mean_disp = np.mean(displacements, axis=0)
             centered_data = displacements - mean_disp
-
-            # Check if data is constant (all displacements the same -> zero centered data)
-            if np.allclose(centered_data, 0, atol=1e-6): # Added tolerance
-                 # print("[SignalGenerator] Debug PCA: Centered data is all zero (no relative motion)") # Noisy
-                 return 0.0, "No relative motion"
-
-            # Calculate the covariance matrix
+            if np.allclose(centered_data, 0, atol=1e-6): return 0.0, "No relative motion"
             cov_matrix = np.cov(centered_data, rowvar=False)
-
-            # Check if covariance matrix is valid
-            if np.allclose(cov_matrix, 0, atol=1e-6): # Added tolerance
-                 # print("[SignalGenerator] Debug PCA: Covariance matrix is zero") # Noisy
-                 return 0.0, "Zero covariance"
-
-
-            # Calculate eigenvalues and eigenvectors
-            eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix) # Use eigh for symmetric matrix
-
-            # Check for valid eigenvalues/vectors (e.g., NaN)
+            if np.allclose(cov_matrix, 0, atol=1e-6): return 0.0, "Zero covariance"
+            eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
             if np.any(np.isnan(eigenvalues)) or np.any(np.isnan(eigenvectors)):
                  print("[SignalGenerator] Warning: NaN encountered in eigenvalues/vectors during PCA.")
                  return 0.0, "NaN in PCA result"
-
-
-            # Find the eigenvector corresponding to the largest eigenvalue (the first principal component)
-            principal_component = eigenvectors[:, np.argmax(eigenvalues)] # Shape (2,)
-
-            # Project the centered displacements onto the principal component
+            principal_component = eigenvectors[:, np.argmax(eigenvalues)]
             projection_magnitudes = np.dot(centered_data, principal_component)
-
-            # Calculate the signal: mean of the *absolute* projections
             signal_value = np.mean(np.abs(projection_magnitudes))
-
-            # print(f"[SignalGenerator] Debug: PCA success. Signal={signal_value:.4f}") # Debug noise
             return signal_value, f"PCA OK ({num_displacements} pts)"
-
         except np.linalg.LinAlgError as e_linalg:
             print(f"[SignalGenerator] NumPy PCA Error: {e_linalg}. Displacements shape: {displacements.shape}")
             return 0.0, "LinAlgError"
@@ -97,7 +72,8 @@ class SignalGenerator:
 
     def process_tracked_features(self, tracked_data_all_rois):
         """
-        Calculates raw motion signals from tracked feature points for multiple ROIs.
+        Calculates raw motion signals from tracked feature points for multiple ROIs
+        using the configured aggregation method (mean or median) on vertical displacement.
 
         Args:
             tracked_data_all_rois (list): A list where each element is a tuple
@@ -128,96 +104,123 @@ class SignalGenerator:
                 # Check shape again after potential reshape
                 if old_points.shape[1] == 2 and new_points.shape[1] == 2:
                     num_points = old_points.shape[0]
-                    if num_points >= self.min_features_for_pca:
-                        # Calculate displacement vectors (dx, dy)
-                        displacements = new_points - old_points # Shape (N, 2)
+                    # Use the potentially renamed config key here
+                    if num_points >= self.min_features_for_signal:
+                        try:
+                            # Calculate displacement vectors (dx, dy)
+                            displacements = new_points - old_points # Shape (N, 2)
 
-                        # Calculate signal using the chosen PCA method
-                        if self.pca_method == 'numpy':
-                            signal_value, reason = self._calculate_pca_signal_numpy(displacements)
-                        # elif self.pca_method == 'sklearn':
-                        #     signal_value, reason = self._calculate_pca_signal_sklearn(displacements)
-                        else:
-                             print(f"[SignalGenerator] Warning: Unknown PCA method '{self.pca_method}'. Defaulting to 0 signal.")
-                             reason = "Unknown PCA method"
-                    else: # Handle cases where points exist but not enough for PCA
-                        reason = f"Too few points ({num_points}/{self.min_features_for_pca})"
+                            # Calculate vertical displacements (dy)
+                            vertical_displacements = displacements[:, 1] # Select only the y-component (index 1)
+
+                            # --- *** NEW: Use configured aggregation method *** ---
+                            if self.aggregation_method == 'median':
+                                signal_value = np.median(vertical_displacements)
+                                reason = f"Median Vertical Disp ({num_points} pts)"
+                            elif self.aggregation_method == 'mean':
+                                signal_value = np.mean(vertical_displacements)
+                                reason = f"Mean Vertical Disp ({num_points} pts)"
+                            else:
+                                # Fallback just in case (shouldn't be reached due to __init__ check)
+                                signal_value = np.median(vertical_displacements)
+                                reason = f"Median Vertical Disp (Fallback) ({num_points} pts)"
+                            # --- *** END AGGREGATION METHOD *** ---
+
+                        except Exception as e_calc:
+                             print(f"[SignalGenerator] Error during {self.aggregation_method.capitalize()} Vertical Displacement calc for ROI {i}: {e_calc}")
+                             traceback.print_exc()
+                             signal_value = 0.0
+                             reason = f"Exception in {self.aggregation_method.capitalize()} Vert Disp"
+
+                    else: # Handle cases where points exist but not enough for calculation
+                        reason = f"Too few points ({num_points}/{self.min_features_for_signal})"
                 else: # Handle case where reshape failed or shape is wrong
                      reason = "Invalid point shape"
             # else: Handled by default reason "Input None/Empty"
 
             # --- More Verbose Debugging ---
-            # Print status for every frame if signal is zero, otherwise print less often
-            if signal_value == 0.0 and reason != "PCA OK (0 pts)": # Don't print if PCA was ok but signal was zero
+            if signal_value == 0.0 and reason != "Input None/Empty":
                  print(f"[SignalGenerator Frame Debug] ROI{i}: Signal=0.0, Reason='{reason}'")
-            # elif np.random.rand() < 0.05: # Print non-zero signals occasionally
+            # elif np.random.rand() < 0.02:
             #      print(f"[SignalGenerator Frame Debug] ROI{i}: Signal={signal_value:.4f}, Reason='{reason}'")
             # --- End Debugging ---
 
-
             raw_signals.append(signal_value)
-            # processing_summary.append(f"ROI{i}:{signal_value:.3f}({reason})") # Less noisy summary
+            # processing_summary.append(f"ROI{i}:{signal_value:.3f}({reason})")
 
-        # Optional: Print summary less frequently than every frame
-        # if np.random.rand() < 0.05: # Print ~5% of the time
+        # Optional: Print summary less frequently
+        # if np.random.rand() < 0.05:
         #    print(f"[SignalGenerator] Debug Summary: {', '.join(processing_summary)}")
 
         return raw_signals
 
 # Example usage (for testing this module directly)
+# NOTE: Assertions updated for the MEDIAN calculation (default)
 if __name__ == '__main__':
-    print("Testing SignalGenerator module...")
+    print("Testing SignalGenerator module (Mean/Median Vertical Displacement Mode)...")
 
     # --- Mock Setup ---
-    mock_config = {
-        'SIGNAL_MIN_FEATURES_FOR_PCA': 3,
-        'SIGNAL_PCA_METHOD': 'numpy'
+    mock_config_median = {
+        'SIGNAL_MIN_FEATURES_FOR_SIGNAL': 3,
+        'SIGNAL_AGGREGATION_METHOD': 'median' # Explicitly median (default)
     }
-    generator = SignalGenerator(config=mock_config)
+    mock_config_mean = {
+        'SIGNAL_MIN_FEATURES_FOR_SIGNAL': 3,
+        'SIGNAL_AGGREGATION_METHOD': 'mean' # Explicitly mean
+    }
+    generator_median = SignalGenerator(config=mock_config_median)
+    generator_mean = SignalGenerator(config=mock_config_mean)
 
-    # --- Mock Tracked Data ---
-    # ROI 1: Simulate vertical motion (respiration-like) + some noise
+
+    # --- Mock Tracked Data (Same as before) ---
     old1 = np.array([[10, 10], [15, 11], [12, 9], [18, 10]], dtype=np.float32)
-    new1 = np.array([[10, 12], [15, 13], [12, 11], [18, 12]], dtype=np.float32) # Moved ~2 units in Y
-
-    # ROI 2: Simulate horizontal motion + noise (less respiration-like)
+    new1 = np.array([[10, 12], [15, 13], [12, 11], [18, 12]], dtype=np.float32) # dy = [2, 2, 2, 2] -> mean=2, median=2
     old2 = np.array([[50, 50], [55, 51], [52, 49], [58, 50], [51, 52]], dtype=np.float32)
-    new2 = np.array([[52, 50], [57, 51.5], [54, 49.5], [60, 50], [53, 51.8]], dtype=np.float32) # Moved ~2 units in X
-
-    # ROI 3: Not enough points
+    new2 = np.array([[52, 50], [57, 51.5], [54, 49.5], [60, 50], [53, 51.8]], dtype=np.float32) # dy = [0, 0.5, 0.5, 0, -0.2] -> mean=0.16, median=0.0
     old3 = np.array([[100, 100], [105, 101]], dtype=np.float32)
-    new3 = np.array([[100, 101], [105, 102]], dtype=np.float32)
-
-    # ROI 4: No points tracked
-    old4, new4 = None, None
-
-    # ROI 5: Constant points (zero displacement)
+    new3 = np.array([[100, 101], [105, 102]], dtype=np.float32) # dy = [1, 1] -> mean=1, median=1 (but too few points)
+    old4, new4 = None, None # -> 0.0
     old5 = np.array([[200, 200], [205, 201], [202, 199]], dtype=np.float32)
-    new5 = old5.copy()
-
-    # ROI 6: Identical displacements (relative motion is zero)
+    new5 = old5.copy() # dy = [0, 0, 0] -> mean=0, median=0
     old6 = np.array([[300, 300], [305, 301], [302, 299]], dtype=np.float32)
-    new6 = old6 + np.array([1, 2], dtype=np.float32) # All points moved by (1, 2)
-
+    new6 = old6 + np.array([1, 2], dtype=np.float32) # dy = [2, 2, 2] -> mean=2, median=2
 
     tracked_data_list = [
         (old1, new1), (old2, new2), (old3, new3), (old4, new4), (old5, new5), (old6, new6)
     ]
 
-    # --- Test Processing ---
-    print("\n--- Processing Mock Data ---")
-    signals = generator.process_tracked_features(tracked_data_list)
+    # --- Test Processing (Median) ---
+    print("\n--- Processing Mock Data (Median Aggregation) ---")
+    signals_median = generator_median.process_tracked_features(tracked_data_list)
+    print(f"Calculated Signals (Median): {signals_median}")
+    # Expected Median: [2.0, 0.0, 0.0 (too few points), 0.0, 0.0, 2.0]
 
-    print(f"\nCalculated Signals: {signals}")
+    # --- Basic Assertions (Median) ---
+    print("\n--- Running Assertions (Median) ---")
+    assert len(signals_median) == len(tracked_data_list), "Median: Number of signals should match number of ROIs"
+    assert np.isclose(signals_median[0], 2.0), f"Median ROI 1 expected ~2.0, got {signals_median[0]}"
+    assert np.isclose(signals_median[1], 0.0), f"Median ROI 2 expected ~0.0, got {signals_median[1]}" # Median is 0.0
+    assert signals_median[2] == 0.0, "Median ROI 3 (not enough points) should produce zero signal"
+    assert signals_median[3] == 0.0, "Median ROI 4 (no points) should produce zero signal"
+    assert signals_median[4] == 0.0, "Median ROI 5 (constant points) should produce zero signal"
+    assert np.isclose(signals_median[5], 2.0), f"Median ROI 6 (identical displacements) should produce signal 2.0, got {signals_median[5]}"
+    print("--- Median Assertions Passed ---")
 
-    # --- Basic Assertions ---
-    assert len(signals) == len(tracked_data_list), "Number of signals should match number of ROIs"
-    assert signals[0] > 0, "ROI 1 (vertical motion) should produce a positive signal"
-    assert signals[1] > 0, "ROI 2 (horizontal motion) should produce a positive signal"
-    assert signals[2] == 0.0, "ROI 3 (not enough points) should produce zero signal"
-    assert signals[3] == 0.0, "ROI 4 (no points) should produce zero signal"
-    assert signals[4] == 0.0, "ROI 5 (constant points) should produce zero signal (Reason: No relative motion)"
-    assert signals[5] == 0.0, "ROI 6 (identical displacements) should produce zero signal (Reason: No relative motion)"
+    # --- Test Processing (Mean) ---
+    print("\n--- Processing Mock Data (Mean Aggregation) ---")
+    signals_mean = generator_mean.process_tracked_features(tracked_data_list)
+    print(f"Calculated Signals (Mean): {signals_mean}")
+    # Expected Mean: [2.0, 0.16, 0.0 (too few points), 0.0, 0.0, 2.0]
 
+    # --- Basic Assertions (Mean) ---
+    print("\n--- Running Assertions (Mean) ---")
+    assert len(signals_mean) == len(tracked_data_list), "Mean: Number of signals should match number of ROIs"
+    assert np.isclose(signals_mean[0], 2.0), f"Mean ROI 1 expected ~2.0, got {signals_mean[0]}"
+    assert np.isclose(signals_mean[1], 0.16), f"Mean ROI 2 expected ~0.16, got {signals_mean[1]}" # Mean is 0.16
+    assert signals_mean[2] == 0.0, "Mean ROI 3 (not enough points) should produce zero signal"
+    assert signals_mean[3] == 0.0, "Mean ROI 4 (no points) should produce zero signal"
+    assert signals_mean[4] == 0.0, "Mean ROI 5 (constant points) should produce zero signal"
+    assert np.isclose(signals_mean[5], 2.0), f"Mean ROI 6 (identical displacements) should produce signal 2.0, got {signals_mean[5]}"
+    print("--- Mean Assertions Passed ---")
 
     print("\nSignalGenerator module test finished.")
