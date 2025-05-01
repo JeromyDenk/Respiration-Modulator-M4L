@@ -1,10 +1,12 @@
 # src/ui/main_window.py
 # Defines the main application window using PyQt6.
-# Updated to handle two-stage worker initialization signals.
+# Includes diagnostic print in _emit_overlay_settings.
 
 import sys
 import os
 import numpy as np
+import threading # For thread ID diagnostic
+
 # --- PyQt6 Imports ---
 try:
     from PyQt6.QtWidgets import (
@@ -130,7 +132,11 @@ class MainWindow(QMainWindow):
         self.pose_overlay_check = QCheckBox("Show Pose")
         self.roi_overlay_check = QCheckBox("Show ROI")
         self.features_overlay_check = QCheckBox("Show Features")
-        # Connect checkboxes to a handler function that emits a signal
+        # --- Set Initial Check States ---
+        self.pose_overlay_check.setChecked(True) # Show pose by default
+        self.roi_overlay_check.setChecked(True)  # Show ROI by default
+        self.features_overlay_check.setChecked(False) # Hide features by default
+        # --- Connect Signals ---
         self.pose_overlay_check.stateChanged.connect(self._emit_overlay_settings)
         self.roi_overlay_check.stateChanged.connect(self._emit_overlay_settings)
         self.features_overlay_check.stateChanged.connect(self._emit_overlay_settings)
@@ -248,13 +254,15 @@ class MainWindow(QMainWindow):
 
     def _emit_overlay_settings(self):
         """Emits the current state of overlay checkboxes."""
-        # TODO: Connect this signal in main.py to a slot in the worker
-        #       that stores these states for use during frame drawing.
         show_pose = self.pose_overlay_check.isChecked()
         show_roi = self.roi_overlay_check.isChecked()
         show_features = self.features_overlay_check.isChecked()
+        # --- *** ADDED THREAD ID PRINT *** ---
+        current_thread_id = threading.get_ident()
+        print(f"[UI Emit - Thread: {current_thread_id}] Emitting overlay_settings_changed: Pose={show_pose}, ROI={show_roi}, Features={show_features}")
+        # --- *** ---
         self.overlay_settings_changed.emit(show_pose, show_roi, show_features)
-        print(f"Overlay settings changed (UI only): Pose={show_pose}, ROI={show_roi}, Features={show_features}")
+
 
     def _update_ui_state(self):
         """Updates enabled/disabled state of widgets."""
@@ -286,8 +294,11 @@ class MainWindow(QMainWindow):
                 self.webcam_label.setText("") # Clear text once valid frame arrives
 
             h, w, ch = frame.shape; bytes_per_line = ch * w
-            qt_format = QImage.Format.Format_BGR888 if ch == 3 else QImage.Format.Format_Grayscale8 if ch == 1 else None
-            if qt_format is None: print(f"Warning: Unexpected frame channel count: {ch}"); return
+            # --- Choose correct format based on channels ---
+            if ch == 3: qt_format = QImage.Format.Format_BGR888
+            elif ch == 1: qt_format = QImage.Format.Format_Grayscale8
+            else: print(f"Warning: Unexpected frame channel count: {ch}"); return # Don't display
+
             qt_image = QImage(frame.data, w, h, bytes_per_line, qt_format)
             pixmap = QPixmap.fromImage(qt_image).scaled(self.webcam_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             self.webcam_label.setPixmap(pixmap)
@@ -348,6 +359,7 @@ class MainWindow(QMainWindow):
                 self.save_button.setEnabled(True)
                 self.profile_combo.setEnabled(True)
                 self._update_ui_state() # Update other UI states based on readiness
+                self._emit_overlay_settings() # Emit initial overlay state
         else:
             # Initialization failed for this component
             fail_msg = f"{component_name} Initialization Failed: {message}"
