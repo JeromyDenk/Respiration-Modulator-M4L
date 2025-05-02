@@ -960,7 +960,7 @@ if __name__ == '__main__':
             print(f"Could not create dummy profiles directory/file: {e}")
     main_win = MainWindow(profiles_dir=PROFILES_DIR_TEST)
     main_win.handle_worker_setup_finished(True, "Simulated video source OK")
-    main_win.handle_component_initialized("PoseDetector", True, "Simulated OK");
+    main_win.handle_component_initialized("PoseDetector", True, "Simulated OK")
     main_win.handle_component_initialized("RoiCalculator", True, "Simulated OK"); # Added RoiCalculator init call
     main_win.handle_component_initialized("PipelineManager", True, "Simulated OK")
     dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8); dummy_frame[:,:,1] = 100 # Greenish frame

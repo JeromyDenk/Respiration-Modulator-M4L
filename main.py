@@ -1,3 +1,4 @@
+# c:\Software Development\Respiration Modulator M4L\main.py
 # main.py
 # Main entry point for the Respiration Modulator application.
 # Sets up the PyQt6 application, creates the UI window, and manages the backend worker thread.
@@ -534,13 +535,28 @@ class PipelineWorker(QObject):
                 # --- Emit Tracking Results ---
                 self.new_frame_ready.emit(processed_frame)
                 if results:
-                    # Emit plot data and status
-                    plot_data = results.get('filtered_signal_history', [])
-                    bpm = results.get('bpm', 0.0)
-                    valid = results.get('bpm_valid', False)
-                    phase = results.get('phase', SignalProcessor.PHASE_UNKNOWN)
+                    # --- ADD PRINT STATEMENT FOR TIMING ---
+                    if 'timing_ms' in results:
+                        timings = results['timing_ms']
+                        print(f"[Timing (ms)] FT: {timings.get('feature_tracker', 0):.1f}, "
+                              f"SG: {timings.get('signal_generator', 0):.1f}, "
+                              f"SP: {timings.get('signal_processor', 0):.1f}, "
+                              f"Total: {timings.get('total_pipeline', 0):.1f}")
+                    # --- END PRINT STATEMENT ---
+
+                    # Emit plot data and status (adjust based on your reverted SignalProcessor interface)
+                    # Example using get methods from the reverted pipeline_manager context:
+                    bpm, bpm_valid = self.pipeline_manager.signal_processor.get_bpm()
+                    phase = self.pipeline_manager.signal_processor.get_phase()
+                    plot_data = self.pipeline_manager.signal_processor.get_filtered_signal_buffer()
+                    # Or if results dict contains them directly (less likely in reverted code):
+                    # plot_data = results.get('filtered_signal_history', [])
+                    # bpm = results.get('bpm', 0.0)
+                    # valid = results.get('bpm_valid', False)
+                    # phase = results.get('phase', SignalProcessor.PHASE_UNKNOWN)
+
                     self.new_plot_data.emit(plot_data)
-                    self.new_status.emit(bpm, valid, phase)
+                    self.new_status.emit(bpm, bpm_valid, phase)
                 else: # Handle case where pipeline_manager.process_frame returned None
                     self.new_plot_data.emit([])
                     self.new_status.emit(0.0, False, SignalProcessor.PHASE_UNKNOWN)

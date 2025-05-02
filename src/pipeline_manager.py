@@ -13,7 +13,7 @@ try:
     # from pose_detector import PoseDetector # Not needed here
     # from coarse_roi_calculator import CoarseRoiCalculator # Not needed here
     from feature_tracker import FeatureTracker
-    from signal_generator import SignalGenerator
+    from signal_generator import SignalGenerator # Assuming this import is correct for the reverted version
     from signal_processor import SignalProcessor
 except ImportError as e:
     print(f"PipelineManager Error: Failed to import sub-modules: {e}")
@@ -83,10 +83,16 @@ class PipelineManager:
         if not self.current_rois:
              print("[PipelineManager] Error: Tracking ROI not set. Cannot process frame.")
              return { # Return default structure
-                'bpm': 0.0, 'bpm_valid': False, 'phase': SignalProcessor.PHASE_UNKNOWN,
+                # Assuming PHASE_UNKNOWN is available or handle import
+                'bpm': 0.0, 'bpm_valid': False, 'phase': 0, # Use 0 if PHASE_UNKNOWN import fails
                 'current_rois': [], 'landmarks': None,
                 'filtered_signal_history': [], 'raw_signal_history': [],
                 'peak_indices': [], 'processing_time': 0,
+                # Add default timing structure
+                'timing_ms': {
+                    'feature_tracker': 0.0, 'signal_generator': 0.0,
+                    'signal_processor': 0.0, 'total_pipeline': 0.0
+                },
                 'recalibration_run_this_frame': False, 'recalibration_succeeded': False,
                 'frame_count': self.frame_count, 'tracked_points': None # Add tracked_points key
              }
@@ -94,6 +100,11 @@ class PipelineManager:
         start_time = time.time()
         self.frame_count += 1
 
+        # --- Initialize timing variables ---
+        t_start_total = time.perf_counter()
+        t_feature_tracker = 0.0
+        t_signal_gen = 0.0
+        t_signal_proc = 0.0
         # --- 1. Input Conversion ---
         try:
             image_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -103,7 +114,9 @@ class PipelineManager:
         tracked_data = []
         current_tracked_points = None # Store the points tracked in *this* frame
         try:
+            t_start_ft = time.perf_counter()
             tracked_data = self.feature_tracker.process_frame(image_gray, self.current_rois)
+            t_end_ft = time.perf_counter()
             # --- Extract points tracked in this frame for returning ---
             if tracked_data and tracked_data[0] is not None:
                  # tracked_data is list of tuples: [(old0, new0), ...]
@@ -112,18 +125,30 @@ class PipelineManager:
                  if new_points is not None:
                       current_tracked_points = new_points # Store for results dict
             # ---
+            t_feature_tracker = (t_end_ft - t_start_ft) * 1000 # Duration in ms
         except Exception as e_track:
              print(f"[PipelineManager] Error during feature tracking: {e_track}"); traceback.print_exc()
              tracked_data = [(None, None)] * len(self.current_rois)
 
         # --- 3. Signal Generation ---
         raw_signals = []
-        if tracked_data:
-            try: raw_signals = self.signal_generator.process_tracked_features(tracked_data)
+        # Check if tracked_data is valid before proceeding
+        if tracked_data and tracked_data[0] is not None: # Check if tracking produced data
+            try:
+                t_start_sg = time.perf_counter()
+                # Assuming process_tracked_features is the correct method in the reverted version
+                raw_signals = self.signal_generator.process_tracked_features(tracked_data)
+                t_end_sg = time.perf_counter()
+                t_signal_gen = (t_end_sg - t_start_sg) * 1000 # Duration in ms
             except Exception as e_siggen: print(f"[PipelineManager] Error during signal generation: {e_siggen}"); traceback.print_exc(); raw_signals = [0.0] * len(tracked_data)
 
         # --- 4. Signal Processing ---
-        try: self.signal_processor.process_signal_values(raw_signals)
+        try:
+            t_start_sp = time.perf_counter()
+            # Assuming process_signal_values is the correct method in the reverted version
+            self.signal_processor.process_signal_values(raw_signals)
+            t_end_sp = time.perf_counter()
+            t_signal_proc = (t_end_sp - t_start_sp) * 1000 # Duration in ms
         except Exception as e_sigproc: print(f"[PipelineManager] Error during signal processing: {e_sigproc}"); traceback.print_exc()
 
         # --- 5. Gather Results ---
@@ -135,6 +160,8 @@ class PipelineManager:
 
         end_time = time.time()
         processing_time = end_time - start_time
+        t_end_total = time.perf_counter()
+        t_total = (t_end_total - t_start_total) * 1000 # Total duration in ms
 
         results = {
             'bpm': bpm, 'bpm_valid': bpm_valid, 'phase': phase,
@@ -143,6 +170,13 @@ class PipelineManager:
             'raw_signal_history': raw_signal_history,
             'peak_indices': peak_indices,
             'processing_time': processing_time,
+            # --- Add timing results (in milliseconds) ---
+            'timing_ms': {
+                'feature_tracker': t_feature_tracker,
+                'signal_generator': t_signal_gen,
+                'signal_processor': t_signal_proc,
+                'total_pipeline': t_total
+            },
             'recalibration_run_this_frame': False, 'recalibration_succeeded': False,
             'frame_count': self.frame_count,
             'tracked_points': current_tracked_points # <<< ADDED tracked points
@@ -153,4 +187,3 @@ class PipelineManager:
         # (Close logic remains the same)
         print("[PipelineManager] Closing pipeline...")
         print("[PipelineManager] Pipeline closed.")
-
