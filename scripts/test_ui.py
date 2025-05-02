@@ -85,7 +85,8 @@ if __name__ == "__main__":
         main_window._update_ui_state()
         # Set a non-initializing status message
         main_window.statusBar.showMessage("UI Test Mode - Backend not running.")
-        main_window.webcam_label.setText("UI Test Mode")
+        # --- REMOVE THIS LINE ---
+        # main_window.webcam_label.setText("UI Test Mode") # VideoWidget has no setText
         # --- *** ---
 
         main_window.show()
