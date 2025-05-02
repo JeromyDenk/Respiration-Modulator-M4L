@@ -171,6 +171,200 @@ class FeaturePlotWindow(QWidget):
             print(f"[FeatureWindow Debug] Invalid data at index {frame_index}. Type: {type(points)}, Shape: {points.shape if hasattr(points, 'shape') else 'N/A'}, Is None: {points is None}")
             self.plot_widget.setTitle(f"Feature Points (Invalid Data @ Frame {frame_index})")
 
+# --- NEW: PCA Vector Window ---
+class PCAVectorWindow(QWidget):
+    """A separate window to display feature displacements and the principal component."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("PCA Displacement Vector")
+        self.min_features_for_pca = 3 # Minimum points needed
+
+        layout = QVBoxLayout(self)
+        self.plot_widget = pg.PlotWidget()
+        layout.addWidget(self.plot_widget)
+
+        self.plot_widget.setAspectLocked(True)
+        self.plot_widget.setLabel('left', 'dY (pixels)')
+        self.plot_widget.setLabel('bottom', 'dX (pixels)')
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        # Set initial range to avoid extreme zoom on first frame
+        self.plot_widget.setRange(xRange=(-10, 10), yRange=(-10, 10), disableAutoRange=True)
+        self.plot_widget.setTitle("Centered Displacements & PCA Vector")
+
+        # Scatter plot for centered displacements
+        self.scatter_item = pg.ScatterPlotItem(size=5, pen=None, brush=(255, 0, 0, 150)) # Red points (RGBA)
+        self.plot_widget.addItem(self.scatter_item)
+
+        # Arrow item for PCA vector
+        self.pca_arrow = pg.ArrowItem(pen=pg.mkPen('y', width=2), brush='y')
+        self.plot_widget.addItem(self.pca_arrow)
+
+        # --- NEW: Arrow item for Mean Displacement Vector ---
+        self.mean_disp_arrow = pg.ArrowItem(pen=pg.mkPen('c', width=1, style=Qt.PenStyle.DashLine), brush='c') # Cyan dashed
+        self.plot_widget.addItem(self.mean_disp_arrow)
+
+        # --- NEW: Ellipse item for Variance ---
+        self.variance_ellipse = pg.Qt.QtWidgets.QGraphicsEllipseItem() # Access via pg.Qt.QtWidgets
+        self.variance_ellipse.setPen(pg.mkPen(color=(255, 255, 255, 150), width=1)) # Semi-transparent white
+        self.plot_widget.addItem(self.variance_ellipse)
+
+        # Text item for status
+        self.status_text = pg.TextItem(anchor=(0, 1), color=(200, 200, 200)) # White text, top-left
+        self.plot_widget.addItem(self.status_text)
+
+    def update_plot(self, frame_index, old_points, new_points):
+        """Calculates PCA and updates the plot for the given frame data."""
+        self.scatter_item.clear()
+        self.pca_arrow.setStyle(headLen=0) # Hide arrow initially
+        self.mean_disp_arrow.setStyle(headLen=0) # Hide mean arrow initially
+        self.variance_ellipse.setRect(0, 0, 0, 0) # Hide ellipse
+        self.status_text.setText("")
+
+        if old_points is None or new_points is None or \
+           len(old_points) < self.min_features_for_pca or len(old_points) != len(new_points):
+            self.status_text.setText(f"Frame {frame_index}: Insufficient/Invalid Points")
+            return
+
+        try:
+            # --- Ensure (N, 2) shape ---
+            old_p = old_points.reshape(-1, 2)
+            new_p = new_points.reshape(-1, 2)
+
+            # --- Robust Filtering for object dtype or non-finite numbers ---
+            valid_indices = []
+            for idx in range(old_p.shape[0]):
+                # Check if all four coordinate values are finite numbers
+                is_valid_row = all(
+                    isinstance(coord, (int, float)) and np.isfinite(coord)
+                    for coord in [old_p[idx, 0], old_p[idx, 1], new_p[idx, 0], new_p[idx, 1]]
+                )
+                if is_valid_row:
+                    valid_indices.append(idx)
+
+            if len(valid_indices) < self.min_features_for_pca:
+                self.status_text.setText(f"Frame {frame_index}: Too few valid numeric points ({len(valid_indices)}) for PCA")
+                return
+
+            # Create new numeric arrays using only valid indices
+            old_p_numeric = old_p[valid_indices].astype(float) # Ensure float dtype
+            new_p_numeric = new_p[valid_indices].astype(float) # Ensure float dtype
+
+            # Calculate displacements only on valid, finite points
+            displacements = new_p_numeric - old_p_numeric
+            # --- End input filtering ---
+
+            # --- NEW: Filter out non-finite displacements ---
+            finite_mask = np.all(np.isfinite(displacements), axis=1)
+            displacements = displacements[finite_mask]
+            if displacements.shape[0] < self.min_features_for_pca: # Check again after filtering
+                self.status_text.setText(f"Frame {frame_index}: Too few finite points ({displacements.shape[0]}) for PCA")
+                return
+            # --- End Filter ---
+
+            # Center the displacements
+            mean_disp = np.mean(displacements, axis=0)
+            centered_disp = displacements - mean_disp
+
+            # --- Update Mean Displacement Arrow ---
+            mean_disp_len = np.linalg.norm(mean_disp)
+            if mean_disp_len > 1e-6: # Only show if mean displacement is significant
+                self.mean_disp_arrow.setPos(0, 0)
+                self.mean_disp_arrow.setStyle(
+                    headLen=10, # Smaller head
+                    tailLen=mean_disp_len,
+                    tailWidth=1,
+                    angle=np.degrees(np.arctan2(mean_disp[1], mean_disp[0]))
+                )
+            # --- End Mean Displacement Arrow ---
+
+
+            # --- Add Check: Ensure at least 2 data points for covariance ---
+            if centered_disp.shape[0] < 2:
+                self.status_text.setText(f"Frame {frame_index}: Too few points ({centered_disp.shape[0]}) for PCA")
+                self.scatter_item.setData(pos=centered_disp) # Still plot the single point if it exists
+                return
+            # --- End Check ---
+            # Plot centered displacements
+            self.scatter_item.setData(pos=centered_disp)
+
+            # --- Add Check: Ensure input to np.cov is 2D with at least 2 rows ---
+            if not isinstance(centered_disp, np.ndarray) or centered_disp.ndim != 2 or centered_disp.shape[0] < 2 or centered_disp.shape[1] != 2:
+                self.status_text.setText(f"Frame {frame_index}: Invalid shape for PCA ({centered_disp.shape if hasattr(centered_disp, 'shape') else type(centered_disp)})")
+                print(f"[PCA Debug] Invalid shape for PCA input: {centered_disp.shape if hasattr(centered_disp, 'shape') else type(centered_disp)}")
+                return
+            # --- End Check ---
+
+            # --- NEW Check: Ensure dtype is numeric before allclose ---
+            if not np.issubdtype(centered_disp.dtype, np.number):
+                self.status_text.setText(f"Frame {frame_index}: Non-numeric data for PCA")
+                print(f"[PCA Debug] Non-numeric dtype detected before np.allclose: {centered_disp.dtype}")
+                return
+            # --- End NEW Check ---
+
+            # --- NEW Check: Handle zero variance case before np.cov ---
+            if np.allclose(centered_disp, centered_disp[0], atol=1e-6): # Check if all rows are close to the first row
+                self.status_text.setText(f"Frame {frame_index}: Zero variance in displacements")
+                print(f"[PCA Debug] Zero variance detected before np.cov")
+                # Optionally plot the points if needed, they will overlap
+                self.scatter_item.setData(pos=centered_disp)
+                return
+            # --- End NEW Check ---
+            # Calculate PCA
+            cov_matrix = np.cov(centered_disp, rowvar=False)
+            if np.allclose(cov_matrix, 0, atol=1e-6):
+                self.status_text.setText(f"Frame {frame_index}: Zero Covariance")
+                return
+
+            eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+            # Sort eigenvalues and eigenvectors in descending order
+            sort_indices = np.argsort(eigenvalues)[::-1]
+            eigenvalues_sorted = eigenvalues[sort_indices]
+            eigenvectors_sorted = eigenvectors[:, sort_indices]
+
+            principal_component = eigenvectors_sorted[:, 0] # First principal component (largest eigenvalue)
+            secondary_component = eigenvectors_sorted[:, 1] # Second principal component
+
+            # Standard deviations along principal axes
+            std_dev1 = np.sqrt(max(0, eigenvalues_sorted[0])) # Ensure non-negative
+            std_dev2 = np.sqrt(max(0, eigenvalues_sorted[1])) # Ensure non-negative
+
+            # --- Update Variance Ellipse ---
+            ellipse_scale = 2.0 # Scale factor (e.g., 2 for ~95% confidence)
+            ellipse_width = std_dev1 * ellipse_scale * 2 # Full width (diameter)
+            ellipse_height = std_dev2 * ellipse_scale * 2 # Full height (diameter)
+            ellipse_angle = np.degrees(np.arctan2(principal_component[1], principal_component[0]))
+
+            # QGraphicsEllipseItem is defined by its top-left corner and width/height
+            # We need to center it at (0,0)
+            ellipse_rect = pg.QtCore.QRectF(-ellipse_width / 2, -ellipse_height / 2, ellipse_width, ellipse_height)
+            self.variance_ellipse.setRect(ellipse_rect)
+            self.variance_ellipse.setRotation(ellipse_angle) # Rotate around its center
+            # --- End Variance Ellipse ---
+
+            # Scale vector for visibility (e.g., based on std dev of projections)
+            projections = np.dot(centered_disp, principal_component) # Projections onto first PC
+            vector_scale = np.std(projections) * 2.0 # Scale by 2x std dev
+            scaled_vector = principal_component * vector_scale
+
+            # --- Corrected: Use setStyle for arrow parameters ---
+            self.pca_arrow.setPos(0, 0) # Start at origin
+            self.pca_arrow.setStyle(
+                headLen=15,
+                tipAngle=30,
+                baseAngle=20,
+                tailLen=np.linalg.norm(scaled_vector),
+                tailWidth=2,
+                angle=np.degrees(np.arctan2(scaled_vector[1], scaled_vector[0])) # Angle in degrees
+            )
+            self.status_text.setText(f"Frame {frame_index}: PCA OK ({len(displacements)} pts)")
+
+        except np.linalg.LinAlgError:
+            self.status_text.setText(f"Frame {frame_index}: LinAlgError in PCA")
+        except Exception as e:
+            self.status_text.setText(f"Frame {frame_index}: Error: {e}")
+            print(f"PCA Window Error: {e}")
+            traceback.print_exc()
+
 class TuningWindow(QMainWindow):
     """Main window for the signal processing tuning application."""
 
@@ -226,6 +420,15 @@ class TuningWindow(QMainWindow):
         feature_win_height = main_geo.height() # Match main window height
         feature_win_width = feature_win_height # Make width equal to height (square)
         self.feature_plot_window.setGeometry(feature_win_x, feature_win_y, feature_win_width, feature_win_height)
+
+        # --- Create PCA Vector Window ---
+        self.pca_vector_window = PCAVectorWindow()
+        self.pca_vector_window.setFont(self.larger_font)
+        # Position below feature window
+        pca_win_x = feature_win_x
+        pca_win_y = feature_win_y + feature_win_height + 30 # Below feature window with gap
+        self.pca_vector_window.setGeometry(pca_win_x, pca_win_y, feature_win_width, feature_win_height) # Same size
+        # --- End PCA Vector Window ---
 
         self._init_ui()
         self.load_data(npz_file_path)
@@ -373,6 +576,11 @@ class TuningWindow(QMainWindow):
         self.show_features_button = QPushButton("Show Feature Plot")
         self.show_features_button.clicked.connect(self.feature_plot_window.show)
         controls_layout.addWidget(self.show_features_button)
+        # --- Add PCA Window Button ---
+        self.show_pca_button = QPushButton("Show PCA Vector Plot")
+        self.show_pca_button.clicked.connect(self.pca_vector_window.show)
+        controls_layout.addWidget(self.show_pca_button)
+        # --- End PCA Window Button ---
         # --- End Show Features Button ---
 
         # Apply font to group box title
@@ -1057,6 +1265,20 @@ class TuningWindow(QMainWindow):
         # Update feature plot window
         self.feature_plot_window.update_plot(self.current_frame_index)
 
+        # --- Update PCA Vector Window ---
+        # Need old and new points for the current transition
+        old_pca_points, new_pca_points = None, None
+        if self.feature_coords is not None:
+            if self.current_frame_index > 0: # Need previous frame for old points
+                old_pca_points = self.feature_coords[self.current_frame_index - 1]
+            if self.current_frame_index < len(self.feature_coords): # Current frame for new points
+                new_pca_points = self.feature_coords[self.current_frame_index]
+        # Pass the relevant points to the PCA window
+        self.pca_vector_window.update_plot(self.current_frame_index, old_pca_points, new_pca_points)
+        # --- End PCA Vector Window Update ---
+
+
+
         # Update timeline slider position (block signals to prevent loop)
         self.timeline_slider.blockSignals(True)
         self.timeline_slider.setValue(self.current_frame_index)
@@ -1161,6 +1383,7 @@ class TuningWindow(QMainWindow):
         """Stops timer on close."""
         self.playback_timer.stop()
         self.feature_plot_window.close() # Close feature window as well
+        self.pca_vector_window.close() # Close PCA window
         event.accept()
 
 
