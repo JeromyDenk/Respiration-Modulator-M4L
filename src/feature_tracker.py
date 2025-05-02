@@ -23,6 +23,8 @@ class FeatureTracker:
                 },
                 'FEATURE_REDETECT_THRESHOLD': Min number of successfully tracked features
                                             before redetection is triggered.
+                'FEATURE_QUALITY_WEIGHTING_ENABLED' (bool): Enable Shi-Tomasi quality weighting.
+                'FEATURE_MIN_QUALITY_SCORE' (float): Minimum Shi-Tomasi score to keep a feature.
                 Defaults are used if config is None or keys are missing.
         """
         if config is None:
@@ -49,6 +51,11 @@ class FeatureTracker:
         # Threshold for re-detecting features - based on *tracked* points count
         self.redetect_threshold = config.get('FEATURE_REDETECT_THRESHOLD', int(self.feature_params.get('maxCorners', 100) * 0.7))
 
+        # --- NEW: Quality Weighting Settings ---
+        self.quality_weighting_enabled = config.get('FEATURE_QUALITY_WEIGHTING_ENABLED', False)
+        self.min_quality_score = config.get('FEATURE_MIN_QUALITY_SCORE', 0.001) # Default to a small positive value
+        # --- END Quality Weighting Settings ---
+
         # --- Internal State ---
         self.prev_gray_frame = None
         # Stores the features from the PREVIOUS frame that will be USED for tracking in the CURRENT frame
@@ -56,6 +63,8 @@ class FeatureTracker:
         # Stores the count of features successfully tracked IN the previous frame
         self.last_tracked_count_per_roi = {}
         # Flag to indicate if the *previous* frame performed detection (True) or tracking (False)
+        # --- NEW: Store qualities corresponding to features_to_track_per_roi ---
+        self.feature_qualities_per_roi = {}
         self.did_detect_last_frame_per_roi = {}
 
         # Debug counter
@@ -65,11 +74,13 @@ class FeatureTracker:
         print(f"  Feature Params: {self.feature_params}")
         print(f"  LK Params: {self.lk_params}")
         print(f"  Redetect Threshold (applied to tracked count): {self.redetect_threshold}")
+        print(f"  Quality Weighting Enabled: {self.quality_weighting_enabled}")
+        if self.quality_weighting_enabled:
+            print(f"  Min Quality Score: {self.min_quality_score}")
 
     def _detect_features(self, gray_frame, roi):
         """
         Detects good features to track within a specific ROI.
-        (Function body remains the same)
         """
         x, y, w, h = roi
         if w <= 0 or h <= 0: return None
@@ -78,12 +89,41 @@ class FeatureTracker:
         if roi_y_start >= roi_y_end or roi_x_start >= roi_x_end: return None
         mask[roi_y_start:roi_y_end, roi_x_start:roi_x_end] = 255
         try:
+            # --- Detect Features ---
             features = cv2.goodFeaturesToTrack(gray_frame, mask=mask, **self.feature_params)
             num_detected = len(features) if features is not None else 0
-            # print(f"[FeatureTracker DETECT] Detected {num_detected} features in ROI {roi}") # Noisy
-            return features
+            if num_detected == 0:
+                return None, None # No features detected
+
+            # --- Calculate Quality Scores (if enabled) ---
+            qualities = None
+            if self.quality_weighting_enabled:
+                # Calculate eigenvalue map - use same block size as goodFeaturesToTrack
+                block_size = self.feature_params.get('blockSize', 7)
+                eigen_map = cv2.cornerMinEigenVal(gray_frame, blockSize=block_size)
+
+                qualities_list = []
+                valid_features_list = []
+                for pt in features.reshape(-1, 2): # Iterate through (x, y) pairs
+                    # --- Use getRectSubPix for bilinear interpolation ---
+                    quality_val = cv2.getRectSubPix(eigen_map, (1, 1), (pt[0], pt[1]))[0, 0]
+
+                    # --- Filter by minimum quality score ---
+                    if quality_val >= self.min_quality_score:
+                        qualities_list.append(quality_val)
+                        valid_features_list.append(pt) # Keep the corresponding feature
+
+                if not valid_features_list: # Check if all features were filtered out
+                    return None, None
+
+                # Convert back to the required shape (N, 1, 2) for features
+                features = np.array(valid_features_list, dtype=np.float32).reshape(-1, 1, 2)
+                qualities = np.array(qualities_list, dtype=np.float32)
+                # print(f"[FeatureTracker DETECT] ROI {roi}: Detected {num_detected}, kept {len(features)} after quality filter ({self.min_quality_score=}).")
+
+            return features, qualities # Return both features and their qualities (or None)
         except cv2.error as e_gftt: print(f"[FeatureTracker DETECT] OpenCV Error detecting features in ROI {roi}: {e_gftt}"); return None
-        except Exception as e: print(f"[FeatureTracker DETECT] Error detecting features in ROI {roi}: {e}"); traceback.print_exc(); return None
+        except Exception as e: print(f"[FeatureTracker DETECT] Error detecting features in ROI {roi}: {e}"); traceback.print_exc(); return None, None
 
     def process_frame(self, current_gray_frame, current_rois):
         """
@@ -98,12 +138,14 @@ class FeatureTracker:
 
         tracked_data_all_rois = []
         next_features_to_track = {} # Features for next tracking attempt
+        next_feature_qualities = {} # Corresponding qualities for next attempt
         current_tracked_count = {} # Count from THIS frame's tracking attempt
         did_detect_this_frame = {} # Track if detection happened THIS frame
 
         for i, roi in enumerate(current_rois):
-            good_old_points, good_new_points = None, None # Defaults for this ROI's output this frame
+            good_old_points, good_new_points, good_qualities = None, None, None # Defaults for this ROI's output
             features_for_current_tracking = self.features_to_track_per_roi.get(i)
+            qualities_for_current_tracking = self.feature_qualities_per_roi.get(i) # Get corresponding qualities
             num_features_for_current = len(features_for_current_tracking) if features_for_current_tracking is not None else 0
             last_tracked_count = self.last_tracked_count_per_roi.get(i, 0)
             was_detection_last_frame = self.did_detect_last_frame_per_roi.get(i, True) # Default to True if no history
@@ -129,11 +171,12 @@ class FeatureTracker:
             if needs_redetection:
                 print(f"[FeatureTracker Frame {self._frame_counter} ROI {i}] Redetecting features. Reason: {redetection_reason}")
                 detection_frame = self.prev_gray_frame if self.prev_gray_frame is not None else current_gray_frame
-                detected_features = self._detect_features(detection_frame, roi)
+                detected_features, detected_qualities = self._detect_features(detection_frame, roi) # Get qualities too
                 next_features_to_track[i] = detected_features
+                next_feature_qualities[i] = detected_qualities # Store detected qualities
                 current_tracked_count[i] = 0 # No points tracked this frame
                 did_detect_this_frame[i] = True # Mark that detection happened
-                tracked_data_all_rois.append((None, None))
+                tracked_data_all_rois.append((None, None, None)) # Output includes None for qualities
                 # print(f"[FeatureTracker Frame {self._frame_counter} ROI {i}] Output: (None, None) due to redetection.") # Noisy
                 continue # Skip tracking
 
@@ -154,18 +197,24 @@ class FeatureTracker:
                     num_tracked_ok = np.sum(valid_mask)
                     # print(f"[FeatureTracker Frame {self._frame_counter} ROI {i}] LK Tracking: {num_tracked_ok}/{num_features_for_current} points tracked successfully.") # Noisy
 
-                    if num_tracked_ok > 0:
+                    if num_tracked_ok > 0: # If some points were tracked successfully
                         good_new_points = next_points[valid_mask]
                         good_old_points = features_for_current_tracking[valid_mask]
                         next_features_to_track[i] = good_new_points.reshape(-1, 1, 2)
+                        # --- Keep corresponding qualities ---
+                        if self.quality_weighting_enabled and qualities_for_current_tracking is not None:
+                            good_qualities = qualities_for_current_tracking[valid_mask]
+                            next_feature_qualities[i] = good_qualities # Store qualities for next frame
+                        else:
+                            next_feature_qualities[i] = None # No qualities if weighting disabled or missing
                     else: # Tracking ran but lost all points
                          next_features_to_track[i] = None
-                         # Output remains (None, None)
+                         next_feature_qualities[i] = None
                 else: # Tracking failed (returned None)
                      next_features_to_track[i] = None
-                     # Output remains (None, None)
+                     next_feature_qualities[i] = None
 
-            except cv2.error as e_lk:
+            except cv2.error as e_lk: # Handle OpenCV specific errors
                 print(f"[FeatureTracker Frame {self._frame_counter} ROI {i}] OpenCV Error tracking features: {e_lk}")
                 next_features_to_track[i] = None; num_tracked_ok = 0
             except Exception as e:
@@ -175,11 +224,12 @@ class FeatureTracker:
             # Store the number of points successfully tracked *this frame*
             current_tracked_count[i] = num_tracked_ok
             # Append the tracked points (or None if failed) for this ROI
-            tracked_data_all_rois.append((good_old_points, good_new_points))
+            tracked_data_all_rois.append((good_old_points, good_new_points, good_qualities)) # Include qualities
 
         # --- Update State for Next Frame ---
         self.prev_gray_frame = current_gray_frame.copy()
         self.features_to_track_per_roi = next_features_to_track # Features for next tracking attempt
+        self.feature_qualities_per_roi = next_feature_qualities # Store qualities for next attempt
         self.last_tracked_count_per_roi = current_tracked_count # Count from THIS frame's tracking attempt
         self.did_detect_last_frame_per_roi = did_detect_this_frame # Store action for next frame's check
 

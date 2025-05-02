@@ -22,7 +22,8 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QGroupBox, QFormLayout, QLabel, QDoubleSpinBox, QComboBox,
-        QPushButton, QSizePolicy, QSpacerItem, QFileDialog, QCheckBox, QMessageBox, QGridLayout, QLineEdit, QSpinBox
+        QPushButton, QSizePolicy, QSpacerItem, QFileDialog, QCheckBox, QMessageBox, QGridLayout, QLineEdit, QSpinBox,
+        QSlider # Import QSlider
     )
     from PyQt6.QtCore import QTimer, Qt, pyqtSlot
     from PyQt6.QtGui import QFont
@@ -44,6 +45,7 @@ if src_dir not in sys.path:
 try:
     from signal_generator import SignalGenerator
     from signal_processor import SignalProcessor
+    # Note: FeatureTracker is not directly used by the tuner, only its config keys
 except ImportError as e:
     print(f"Fatal Error: Failed to import SignalGenerator or SignalProcessor from 'src': {e}")
     traceback.print_exc()
@@ -268,6 +270,15 @@ class TuningWindow(QMainWindow):
         # Apply font to bottom axis ticks (only need to set on one linked axis)
         self.filtered_plot_widget.getAxis('bottom').setTickFont(self.larger_font)
 
+        # --- Timeline Scrubber ---
+        self.timeline_slider = QSlider(Qt.Orientation.Horizontal)
+        self.timeline_slider.setMinimum(0)
+        self.timeline_slider.setMaximum(0) # Will be set when data loads
+        self.timeline_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.timeline_slider.setTickInterval(10) # Example interval
+        self.timeline_slider.sliderMoved.connect(self._slider_value_changed) # Update plots while dragging
+        self.timeline_slider.sliderPressed.connect(self._pause_on_slider_press) # Pause playback on drag
+
         # --- Spectrum Plot ---
         self.spectrum_plot_widget = pg.PlotWidget(title="Frequency Spectrum")
         self.spectrum_plot_widget.setLabel('left', 'Magnitude')
@@ -287,6 +298,7 @@ class TuningWindow(QMainWindow):
 
         plot_layout.addWidget(self.raw_plot_widget)
         plot_layout.addWidget(self.filtered_plot_widget)
+        plot_layout.addWidget(self.timeline_slider) # Add slider below main plots
 
         main_layout.addWidget(plot_widget_container, 3) # Give plots more space
         # --- Add Displacement Histogram Plot ---
@@ -523,6 +535,8 @@ class TuningWindow(QMainWindow):
                 self.feature_plot_window.set_data(self.timestamps, self.feature_coords)
 
         except FileNotFoundError:
+            # --- Clear slider on error ---
+            self.timeline_slider.setMaximum(0)
             print(f"Error: Recording file not found at {file_path}")
             QApplication.quit()
         except Exception as e:
@@ -530,6 +544,13 @@ class TuningWindow(QMainWindow):
             traceback.print_exc()
             QApplication.quit()
 
+        # --- Set slider range after loading data ---
+        if self.timestamps is not None:
+            max_index = len(self.timestamps) - 1
+            self.timeline_slider.setMaximum(max_index if max_index >= 0 else 0)
+            # Adjust tick interval based on data length
+            tick_interval = max(1, max_index // 20) # Aim for ~20 ticks
+            self.timeline_slider.setTickInterval(tick_interval)
     def _apply_settings(self):
         """Reads UI controls and re-initializes processing components."""
         print("Applying settings...")
@@ -555,10 +576,12 @@ class TuningWindow(QMainWindow):
 
     def _gather_settings_from_ui(self):
         """Gathers current settings from UI widgets into a dictionary."""
+        # Note: Optical flow params are not configurable in this tuner UI
         settings = {
-            'feature_tracker': { # Include dummy FT section for structure consistency
-                'OPTICAL_FLOW_PARAMS': {} # Add if needed later
+            'feature_tracker': { # Keep FT section for structure consistency, but empty
+                'OPTICAL_FLOW_PARAMS': {}
             },
+            # Signal Generator settings remain the same
             'signal_generator': {
                 'SIGNAL_AGGREGATION_METHOD': self.aggMethod_combo.currentText(),
                 'IQR_FILTER_ENABLED': self.iqr_filter_checkbox.isChecked(), # Save IQR state
@@ -576,12 +599,12 @@ class TuningWindow(QMainWindow):
     def _populate_ui_from_settings(self, settings_dict):
         """Populates UI widgets from a settings dictionary."""
         print("[UI] Populating settings widgets from loaded profile.")
+        # --- Default empty dicts ---
+        ft_settings = settings_dict.get('feature_tracker', {})
+        sg_settings = settings_dict.get('signal_generator', {})
+        sp_settings = settings_dict.get('signal_processor', {})
         try:
-            # Get sections, providing empty dicts as fallback
-            sg_settings = settings_dict.get('signal_generator', {})
-            sp_settings = settings_dict.get('signal_processor', {})
-
-            # Populate Signal Generator widgets
+            # Populate Signal Generator widgets (no FT widgets to populate)
             agg_method = sg_settings.get('SIGNAL_AGGREGATION_METHOD', 'median')
             self.aggMethod_combo.setCurrentText(agg_method)
             # --- Populate IQR Filter Widgets ---
@@ -725,10 +748,13 @@ class TuningWindow(QMainWindow):
             # --- Prepare data for SignalGenerator and Histogram ---
             tracked_data_list = []
             all_displacements_per_frame = [] # Store displacements for histogram
+            # --- IMPORTANT LIMITATION ---
+            # The .npz file does NOT contain quality scores. Therefore, the recalculation
+            # here CANNOT simulate the effect of quality weighting. We pass None for qualities.
             for i in range(len(self.feature_coords) - 1):
                 old_p = self.feature_coords[i]
                 new_p = self.feature_coords[i+1]
-                tracked_data_list.append((old_p, new_p)) # Add pair for SignalGenerator
+                tracked_data_list.append((old_p, new_p, None)) # Pass None for qualities
 
                 # Basic matching by index (crude approximation)
                 min_len = min(len(old_p) if old_p is not None else 0, len(new_p) if new_p is not None else 0)
@@ -741,7 +767,7 @@ class TuningWindow(QMainWindow):
                     all_displacements_per_frame.append(np.array([])) # Empty array for this frame
 
             # Add empty data for the last frame (no displacement)
-            tracked_data_list.append((self.feature_coords[-1], self.feature_coords[-1])) # Dummy pair for last frame
+            tracked_data_list.append((self.feature_coords[-1], self.feature_coords[-1], None)) # Dummy pair, None qualities
             all_displacements_per_frame.append(np.array([])) # Empty for last frame
 
             # Store displacements for live histogram update
@@ -828,8 +854,12 @@ class TuningWindow(QMainWindow):
 
         try:
             # Flatten all valid, finite displacements
+            # --- MODIFIED: Add checks for type and numeric dtype ---
             all_disp_flat = np.concatenate([
-                d[np.isfinite(d)] for d in self._live_displacements if d is not None and d.size > 0
+                d[np.isfinite(d)] for d in self._live_displacements
+                if isinstance(d, np.ndarray) # Check if it's a numpy array
+                and np.issubdtype(d.dtype, np.number) # Check if dtype is numeric
+                and d.size > 0 # Check if not empty
             ])
 
             if all_disp_flat.size == 0:
@@ -911,6 +941,8 @@ class TuningWindow(QMainWindow):
         self.current_frame_index = 0
         self._update_plots_for_frame(self.current_frame_index) # Update all plots for frame 0
         if self.is_playing:
+            # If playing, reset the timer baseline to effectively restart from 0
+            # If paused, just setting the index is enough
             self.playback_start_time = time.time() # Reset timer baseline
         print("Playback reset.")
 
@@ -1025,6 +1057,10 @@ class TuningWindow(QMainWindow):
         # Update feature plot window
         self.feature_plot_window.update_plot(self.current_frame_index)
 
+        # Update timeline slider position (block signals to prevent loop)
+        self.timeline_slider.blockSignals(True)
+        self.timeline_slider.setValue(self.current_frame_index)
+        self.timeline_slider.blockSignals(False)
         # Update displacement histogram
         self._update_histogram_plot()
 
@@ -1105,6 +1141,21 @@ class TuningWindow(QMainWindow):
         if new_index != self.current_frame_index:
             self._update_plots_for_frame(new_index)
             print(f"Stepped forward to frame {new_index}")
+
+    @pyqtSlot(int)
+    def _slider_value_changed(self, value):
+        """Handles the timeline slider being moved."""
+        if self.timestamps is None or not (0 <= value < len(self.timestamps)):
+            return
+        # Only update if the index actually changes
+        if value != self.current_frame_index:
+            self._update_plots_for_frame(value)
+
+    @pyqtSlot()
+    def _pause_on_slider_press(self):
+        """Pauses playback when the user starts dragging the slider."""
+        if self.is_playing:
+            self.play_pause_button.setChecked(False) # This triggers _toggle_playback to pause
 
     def closeEvent(self, event):
         """Stops timer on close."""

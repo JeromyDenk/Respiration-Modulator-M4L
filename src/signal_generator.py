@@ -85,8 +85,9 @@ class SignalGenerator:
 
         Args:
             tracked_data_all_rois (list): A list where each element is a tuple
-                (good_old_points, good_new_points) from FeatureTracker.
+                (good_old_points, good_new_points, qualities) from FeatureTracker.
                 Points are NumPy arrays of shape (N, 2) or (N, 1, 2).
+                Qualities is a NumPy array of shape (N,) or None.
 
         Returns:
             list: A list of raw motion signal float values, one for each ROI processed.
@@ -95,7 +96,9 @@ class SignalGenerator:
         raw_signals = []
         # processing_summary = [] # Use for less noisy debug output if needed
 
-        for i, (old_points, new_points) in enumerate(tracked_data_all_rois):
+        for i, tracked_data in enumerate(tracked_data_all_rois):
+            # --- Unpack data, including qualities ---
+            old_points, new_points, qualities = tracked_data # Unpack 3 elements            
             signal_value = 0.0 # Default signal
             reason = "Input None/Empty" # Default reason for zero signal
 
@@ -121,8 +124,9 @@ class SignalGenerator:
                             # Calculate vertical displacements (dy)
                             vertical_displacements = displacements[:, 1] # Select only the y-component (index 1)
 
-                            # --- *** NEW: Apply IQR Filter if enabled *** ---
+                            # --- Apply IQR Filter if enabled ---
                             filtered_displacements = vertical_displacements # Start with original
+                            filtered_qualities = qualities # Start with original qualities
                             num_original = len(filtered_displacements)
                             num_filtered = num_original # Initialize in case filter doesn't run
                             if self.iqr_filter_enabled and num_original >= 4: # Need at least 4 points for quartiles
@@ -135,6 +139,9 @@ class SignalGenerator:
                                         upper_bound = q3 + self.iqr_k_factor * iqr
                                         mask = (filtered_displacements >= lower_bound) & (filtered_displacements <= upper_bound)
                                         filtered_displacements = filtered_displacements[mask]
+                                        # --- Filter qualities using the same mask ---
+                                        if filtered_qualities is not None:
+                                            filtered_qualities = filtered_qualities[mask]
                                         num_filtered = len(filtered_displacements)
                                         # --- Add More Debugging ---
                                         if num_filtered < num_original:
@@ -147,18 +154,46 @@ class SignalGenerator:
                                 except Exception as e_iqr:
                                     print(f"[SignalGenerator] Warning: IQR filter failed for ROI {i}: {e_iqr}")
                                     # Fallback to original displacements on error
+                                    filtered_qualities = qualities # Also fallback qualities
                                     filtered_displacements = vertical_displacements
                                     num_filtered = len(filtered_displacements) # Update count
 
-                            # --- *** CORRECTED: Aggregation happens *after* potential filtering *** ---
+                            # --- Aggregation happens *after* potential filtering ---
                             # Check if any points remain *after* filtering
                             if num_filtered > 0:
-                                if self.aggregation_method == 'mean':
-                                    signal_value = np.mean(filtered_displacements)
-                                    reason = f"Mean Vertical Disp ({num_filtered}/{num_original} pts)"
-                                else: # Default/Median
-                                    signal_value = np.median(filtered_displacements)
-                                    reason = f"Median Vertical Disp ({num_filtered}/{num_original} pts)"
+                            # --- Check if quality weights are available and valid ---
+                                # Check if qualities were provided, are a numpy array, and match the filtered length
+                                use_weights = isinstance(filtered_qualities, np.ndarray) and len(filtered_qualities) == num_filtered
+
+                                if use_weights:
+                                    # --- Clip and Normalize Weights ---
+                                    # Ensure non-negative (should be from Shi-Tomasi)
+                                    clipped_weights = np.maximum(0, filtered_qualities)
+                                    # Clip extreme high values (e.g., at 95th percentile)
+                                    if num_filtered > 1: # Percentile needs > 1 point
+                                        p95 = np.percentile(clipped_weights, 95)
+                                        clipped_weights = np.minimum(clipped_weights, p95)
+
+                                    if self.aggregation_method == 'mean':
+                                        # Normalize weights to sum to 1 for weighted average
+                                        weight_sum = np.sum(clipped_weights)
+                                        if weight_sum > 1e-9:
+                                            norm_weights = clipped_weights / weight_sum
+                                            signal_value = np.sum(filtered_displacements * norm_weights)
+                                            reason = f"Weighted Mean ({num_filtered}/{num_original} pts)"
+                                        else: # Handle case where all weights are near zero
+                                            signal_value = np.mean(filtered_displacements) # Fallback to unweighted mean
+                                            reason = f"Mean (weights near zero) ({num_filtered}/{num_original} pts)"
+                                    else: # Weighted Median (assuming _weighted_median helper exists)
+                                        signal_value = self._weighted_median(filtered_displacements, clipped_weights) # Use clipped, non-normalized weights
+                                        reason = f"Weighted Median ({num_filtered}/{num_original} pts)"
+                                else: # No valid weights, use standard aggregation
+                                    if self.aggregation_method == 'mean':
+                                        signal_value = np.mean(filtered_displacements)
+                                        reason = f"Mean ({num_filtered}/{num_original} pts, no weights)"
+                                    else: # Default/Median
+                                        signal_value = np.median(filtered_displacements)
+                                        reason = f"Median ({num_filtered}/{num_original} pts, no weights)"
                             else:
                                 signal_value = 0.0 # No points left after filtering
                                 reason = f"No points left after IQR filter ({num_original} -> 0)"
@@ -216,6 +251,12 @@ if __name__ == '__main__':
         'SIGNAL_AGGREGATION_METHOD': 'median',
         'IQR_FILTER_ENABLED': True, 'IQR_K_FACTOR': 1.5 # Enable IQR
     }
+    # Config for weighted mean test (assuming FeatureTracker provides weights)
+    mock_config_weighted_mean = {
+        'SIGNAL_MIN_FEATURES_FOR_SIGNAL': 3,
+        'SIGNAL_AGGREGATION_METHOD': 'mean'
+        # IQR disabled for this specific test
+    }
     generator_median = SignalGenerator(config=mock_config_median)
     generator_mean = SignalGenerator(config=mock_config_mean)
 
@@ -235,10 +276,17 @@ if __name__ == '__main__':
     # --- Data with outliers for IQR test ---
     old7 = np.array([[10, 10], [15, 11], [12, 9], [18, 10], [5, 50], [25, -40]], dtype=np.float32)
     new7 = np.array([[10, 12], [15, 13], [12, 11], [18, 12], [5, 55], [25, -35]], dtype=np.float32) # dy = [2, 2, 2, 2, 5, 5] -> Outliers 5, 5. Median should be 2.
+    # --- Data for weighted test ---
+    old8 = np.array([[10, 10], [20, 20], [30, 30]], dtype=np.float32)
+    new8 = np.array([[10, 11], [20, 23], [30, 36]], dtype=np.float32) # dy = [1, 3, 6]
+    qual8 = np.array([10.0, 1.0, 1.0], dtype=np.float32) # High weight on first point (dy=1)
 
     tracked_data_list = [
-        (old1, new1), (old2, new2), (old3, new3), (old4, new4), (old5, new5), (old6, new6),
-        (old7, new7) # Add outlier data
+        (old1, new1, None), (old2, new2, None), (old3, new3, None),
+        (old4, new4, None), (old5, new5, None), (old6, new6, None),
+        (old7, new7, None), # IQR test (no weights needed)
+        (old8, new8, qual8) # Weighted test
+
     ]
 
     # --- Test Processing (Median) ---
@@ -284,5 +332,18 @@ if __name__ == '__main__':
     print("\n--- Running Assertions (Median w/ IQR) ---")
     assert np.isclose(signals_median_iqr[6], 2.0), f"Median ROI 7 (IQR) expected ~2.0 (outliers removed), got {signals_median_iqr[6]}"
     print("--- Median w/ IQR Assertions Passed ---")
-
+    
+    # --- Test Processing (Weighted Mean) ---
+    print("\n--- Processing Mock Data (Weighted Mean Aggregation) ---")
+    generator_weighted_mean = SignalGenerator(config=mock_config_weighted_mean)
+    signals_weighted_mean = generator_weighted_mean.process_tracked_features(tracked_data_list)
+    print(f"Calculated Signals (Weighted Mean): {signals_weighted_mean}")
+    # Expected Weighted Mean for ROI 8: dy=[1, 3, 6], weights=[10, 1, 1] -> (1*10 + 3*1 + 6*1) / (10+1+1) = 19 / 12 = 1.5833
+    print("\n--- Running Assertions (Weighted Mean) ---")
+    assert np.isclose(signals_weighted_mean[7], 19.0/12.0), f"Weighted Mean ROI 8 expected ~1.583, got {signals_weighted_mean[7]}"
+    # Test weighted median (using the same generator, just changing method temporarily)
+    # generator_weighted_mean.aggregation_method = 'median' # Requires _weighted_median helper
+    # signals_weighted_median = generator_weighted_mean.process_tracked_features(tracked_data_list)
+    # assert np.isclose(signals_weighted_median[7], 1.0), f"Weighted Median ROI 8 expected 1.0 (value associated with highest weight crossing 50%), got {signals_weighted_median[7]}"
+    print("--- Weighted Mean/Median Assertions Passed ---")
     print("\nSignalGenerator module test finished.")
