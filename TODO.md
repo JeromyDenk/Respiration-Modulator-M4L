@@ -38,3 +38,11 @@ Explore and potentially implement explicit outlier removal strategies before agg
 ## Documentation
 
 -   **(Placeholder)** Update README or add comments explaining any new features (like outlier removal methods) or significant bug fixes.
+
+
+MORE TODO
+
+Implement PCA-based signal generation as a toggleable alternative to median vertical displacement.
+
+Feature Quality Weighting (Shi-Tomasi Score)
+

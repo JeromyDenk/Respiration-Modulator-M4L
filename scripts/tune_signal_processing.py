@@ -377,10 +377,18 @@ class TuningWindow(QMainWindow):
         self.recalc_raw_checkbox.setToolTip("Recalculate raw signal from feature points using selected method.")
         self.recalc_raw_checkbox.setFont(self.larger_font) # Apply font
         self.recalc_raw_checkbox.setChecked(True) # Set to checked by default
-        # --- Add checkbox to compare mean/median ---
         self.compare_agg_checkbox = QCheckBox("Compare Mean vs Median")
         self.compare_agg_checkbox.setToolTip("When recalculating, show both mean (blue) and median (orange) raw signals.")
         self.compare_agg_checkbox.setFont(self.larger_font) # Apply font
+        # --- Add IQR Filter Controls ---
+        self.iqr_filter_checkbox = QCheckBox("Enable IQR Outlier Filter")
+        self.iqr_filter_checkbox.setFont(self.larger_font)
+        self.iqr_k_spin = QDoubleSpinBox(minimum=0.5, maximum=5.0, singleStep=0.1, decimals=1, value=1.5)
+        self.iqr_k_spin.setFont(self.larger_font)
+        self.iqr_k_spin.setEnabled(False) # Disabled by default
+        self.iqr_filter_checkbox.toggled.connect(self.iqr_k_spin.setEnabled) # Enable/disable spinbox with checkbox
+        # --- End IQR Filter Controls ---
+
         sg_layout.addRow(self.recalc_raw_checkbox)
         sg_agg_label = QLabel("Aggregation:") # Create label explicitly
         sg_agg_label.setFont(self.larger_font) # Apply font
@@ -388,6 +396,8 @@ class TuningWindow(QMainWindow):
         controls_layout.addWidget(sg_group)
         # Apply font to group box title
         sg_group.setFont(self.larger_font)
+        sg_layout.addRow(self.iqr_filter_checkbox) # Add IQR checkbox
+        sg_layout.addRow("IQR k-factor:", self.iqr_k_spin) # Add IQR spinbox
         sg_layout.addRow(self.compare_agg_checkbox) # Add the checkbox to the layout
 
         # Signal Processor Settings
@@ -523,7 +533,11 @@ class TuningWindow(QMainWindow):
     def _apply_settings(self):
         """Reads UI controls and re-initializes processing components."""
         print("Applying settings...")
-        sg_config = {'SIGNAL_AGGREGATION_METHOD': self.aggMethod_combo.currentText()}
+        sg_config = {
+            'SIGNAL_AGGREGATION_METHOD': self.aggMethod_combo.currentText(),
+            'IQR_FILTER_ENABLED': self.iqr_filter_checkbox.isChecked(), # Read IQR checkbox
+            'IQR_K_FACTOR': self.iqr_k_spin.value() # Read IQR spinbox
+        }
         sp_config = {
             'SIGNAL_FILTER_LOW_HZ': self.filtLow_spin.value(),
             'SIGNAL_FILTER_HIGH_HZ': self.filtHigh_spin.value(),
@@ -546,7 +560,9 @@ class TuningWindow(QMainWindow):
                 'OPTICAL_FLOW_PARAMS': {} # Add if needed later
             },
             'signal_generator': {
-                'SIGNAL_AGGREGATION_METHOD': self.aggMethod_combo.currentText()
+                'SIGNAL_AGGREGATION_METHOD': self.aggMethod_combo.currentText(),
+                'IQR_FILTER_ENABLED': self.iqr_filter_checkbox.isChecked(), # Save IQR state
+                'IQR_K_FACTOR': self.iqr_k_spin.value() # Save IQR k-factor
             },
             'signal_processor': {
                 'SIGNAL_FILTER_LOW_HZ': self.filtLow_spin.value(),
@@ -568,6 +584,11 @@ class TuningWindow(QMainWindow):
             # Populate Signal Generator widgets
             agg_method = sg_settings.get('SIGNAL_AGGREGATION_METHOD', 'median')
             self.aggMethod_combo.setCurrentText(agg_method)
+            # --- Populate IQR Filter Widgets ---
+            iqr_enabled = sg_settings.get('IQR_FILTER_ENABLED', False)
+            self.iqr_filter_checkbox.setChecked(iqr_enabled)
+            self.iqr_k_spin.setValue(sg_settings.get('IQR_K_FACTOR', 1.5))
+            self.iqr_k_spin.setEnabled(iqr_enabled) # Ensure spinbox state matches checkbox
 
             # Populate Signal Processor widgets
             self.filtLow_spin.setValue(sp_settings.get('SIGNAL_FILTER_LOW_HZ', 0.1))
@@ -694,72 +715,70 @@ class TuningWindow(QMainWindow):
                 print("Error: Feature coordinate data is missing or length mismatch.")
                 return
 
-            # --- Ensure these are indented inside the 'if' block ---
-            recalculated_raw_mean = []
-            recalculated_raw_median = []
+        # --- Recalculate Raw Signal using SignalGenerator (Optional) ---
+        if self.recalc_raw_checkbox.isChecked():
+            print("Recalculating raw signal using SignalGenerator...")
+            if self.feature_coords is None or len(self.feature_coords) != len(self.timestamps):
+                print("Error: Feature coordinate data is missing or length mismatch for recalculation.")
+                return
+
+            # --- Prepare data for SignalGenerator and Histogram ---
+            tracked_data_list = []
             all_displacements_per_frame = [] # Store displacements for histogram
-            # Need pairs of frames for displacement
             for i in range(len(self.feature_coords) - 1):
-                # Simulate FeatureTracker output: (old_points, new_points)
-                # We only have new points for each frame, so use frame i and i+1
-                # This assumes feature_coords[i] corresponds to points *at* timestamps[i]
-                # A better recording format might store old/new pairs directly.
-                # For now, approximate displacement between consecutive frames.
-                # Note: This approximation might differ from the original live calculation.
                 old_p = self.feature_coords[i]
                 new_p = self.feature_coords[i+1]
+                tracked_data_list.append((old_p, new_p)) # Add pair for SignalGenerator
 
                 # Basic matching by index (crude approximation)
                 min_len = min(len(old_p) if old_p is not None else 0, len(new_p) if new_p is not None else 0)
                 if min_len > 0:
-                    # --- Reshape points to (N, 2) before indexing ---
                     old_p_2d = old_p[:min_len].reshape(-1, 2)
                     new_p_2d = new_p[:min_len].reshape(-1, 2)
                     displacements = new_p_2d[:, 1] - old_p_2d[:, 1] # Y_new - Y_old
                     all_displacements_per_frame.append(displacements) # Store for histogram
-
-                    # Calculate mean and median
-                    mean_disp = np.mean(displacements) if len(displacements) > 0 else 0.0
-                    median_disp = np.median(displacements) if len(displacements) > 0 else 0.0
-
-                    # Append to respective lists (apply inversion like in pipeline_manager)
-                    recalculated_raw_mean.append(-mean_disp)
-                    recalculated_raw_median.append(-median_disp)
                 else:
-                    recalculated_raw_mean.append(0.0)
-                    recalculated_raw_median.append(0.0)
                     all_displacements_per_frame.append(np.array([])) # Empty array for this frame
 
-            # Pad the last frame signal (no displacement available)
-            recalculated_raw_mean.append(recalculated_raw_mean[-1] if recalculated_raw_mean else 0.0)
-            recalculated_raw_median.append(recalculated_raw_median[-1] if recalculated_raw_median else 0.0)
+            # Add empty data for the last frame (no displacement)
+            tracked_data_list.append((self.feature_coords[-1], self.feature_coords[-1])) # Dummy pair for last frame
             all_displacements_per_frame.append(np.array([])) # Empty for last frame
 
             # Store displacements for live histogram update
-            # --- Add attribute to store displacements ---
-
             self._live_displacements = all_displacements_per_frame
-            # --- Calculate fixed histogram ranges ---
             self._calculate_and_set_histogram_ranges()
 
-            # Decide which signal(s) to use based on checkboxes
-            compare_mode = self.compare_agg_checkbox.isChecked()
-            primary_method = self.aggMethod_combo.currentText()
+            # --- Use the configured SignalGenerator ---
+            # Note: self.signal_generator was already initialized in _apply_settings()
+            recalculated_primary_signal = self.signal_generator.process_tracked_features(tracked_data_list)
+            # Apply inversion (as done in pipeline_manager)
+            self.raw_signal_processed = -np.array(recalculated_primary_signal)
+            print(f"Raw signal recalculated using SignalGenerator ({self.signal_generator.aggregation_method}, IQR: {self.signal_generator.iqr_filter_enabled}).")
 
+            # --- Handle Compare Mode ---
+            compare_mode = self.compare_agg_checkbox.isChecked()
             if compare_mode:
-                # In compare mode, blue is mean, orange is median
-                self.raw_signal_processed = np.array(recalculated_raw_mean)
-                # --- Add attribute to store alt signal ---
-                self.raw_signal_alt_processed = np.array(recalculated_raw_median) # Store median in alt
-                print(f"Raw signals recalculated (Mean/Median Compare Mode).")
+                # Create a temporary generator with the *opposite* aggregation method
+                # but the same IQR settings
+                primary_method = self.signal_generator.aggregation_method
+                alt_method = 'median' if primary_method == 'mean' else 'mean'
+                alt_sg_config = {
+                    'SIGNAL_AGGREGATION_METHOD': alt_method,
+                    'IQR_FILTER_ENABLED': self.signal_generator.iqr_filter_enabled,
+                    'IQR_K_FACTOR': self.signal_generator.iqr_k_factor,
+                    'SIGNAL_MIN_FEATURES_FOR_SIGNAL': self.signal_generator.min_features_for_signal
+                }
+                try:
+                    alt_signal_generator = SignalGenerator(config=alt_sg_config)
+                    recalculated_alt_signal = alt_signal_generator.process_tracked_features(tracked_data_list)
+                    # Apply inversion
+                    self.raw_signal_alt_processed = -np.array(recalculated_alt_signal)
+                    print(f"Alternative raw signal recalculated using SignalGenerator ({alt_method}, IQR: {alt_sg_config['IQR_FILTER_ENABLED']}).")
+                except Exception as e_alt:
+                    print(f"Error creating/using alternative SignalGenerator: {e_alt}")
+                    self.raw_signal_alt_processed = None
             else:
-                # Use the selected primary method
-                if primary_method == "mean":
-                    self.raw_signal_processed = np.array(recalculated_raw_mean)
-                else: # Default to median
-                    self.raw_signal_processed = np.array(recalculated_raw_median)
                 self.raw_signal_alt_processed = None # No alternative signal
-                print(f"Raw signal recalculated using '{primary_method}'.")
 
             # --- End Recalculation ---
 

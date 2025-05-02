@@ -27,16 +27,24 @@ class SignalGenerator:
             config = {}
 
         # Minimum number of valid displacement vectors required for calculation
-        self.min_features_for_signal = config.get('SIGNAL_MIN_FEATURES_FOR_SIGNAL',
-                                                  config.get('SIGNAL_MIN_FEATURES_FOR_PCA', 3)) # Fallback for old key name
+        self.min_features_for_signal = config.get('SIGNAL_MIN_FEATURES_FOR_SIGNAL', 3)
 
-        # --- NEW: Configuration for aggregation method ---
+        # Configuration for aggregation method
         self.aggregation_method = config.get('SIGNAL_AGGREGATION_METHOD', 'median').lower()
         if self.aggregation_method not in ['mean', 'median']:
             print(f"[SignalGenerator] Warning: Invalid SIGNAL_AGGREGATION_METHOD '{self.aggregation_method}'. Defaulting to 'median'.")
             self.aggregation_method = 'median'
 
-        print(f"[SignalGenerator] Initialized (Using {self.aggregation_method.capitalize()} Vertical Displacement).") # Updated message
+        # --- NEW: Configuration for IQR Outlier Filtering ---
+        self.iqr_filter_enabled = config.get('IQR_FILTER_ENABLED', False)
+        self.iqr_k_factor = config.get('IQR_K_FACTOR', 1.5)
+        # Ensure k factor is reasonable
+        if not isinstance(self.iqr_k_factor, (int, float)) or self.iqr_k_factor <= 0:
+            print(f"[SignalGenerator] Warning: Invalid IQR_K_FACTOR '{self.iqr_k_factor}'. Defaulting to 1.5.")
+            self.iqr_k_factor = 1.5
+        # --- END IQR Config ---
+
+        print(f"[SignalGenerator] Initialized (Using {self.aggregation_method.capitalize()} Vertical Displacement).")
         print(f"  Min Features for Signal Calc: {self.min_features_for_signal}")
         print(f"  Aggregation Method: {self.aggregation_method}")
 
@@ -113,18 +121,53 @@ class SignalGenerator:
                             # Calculate vertical displacements (dy)
                             vertical_displacements = displacements[:, 1] # Select only the y-component (index 1)
 
-                            # --- *** NEW: Use configured aggregation method *** ---
-                            if self.aggregation_method == 'median':
-                                signal_value = np.median(vertical_displacements)
-                                reason = f"Median Vertical Disp ({num_points} pts)"
-                            elif self.aggregation_method == 'mean':
-                                signal_value = np.mean(vertical_displacements)
-                                reason = f"Mean Vertical Disp ({num_points} pts)"
+                            # --- *** NEW: Apply IQR Filter if enabled *** ---
+                            filtered_displacements = vertical_displacements # Start with original
+                            num_original = len(filtered_displacements)
+                            num_filtered = num_original # Initialize in case filter doesn't run
+                            if self.iqr_filter_enabled and num_original >= 4: # Need at least 4 points for quartiles
+                                try:
+                                    q1, q3 = np.percentile(filtered_displacements, [25, 75])
+                                    iqr = q3 - q1
+                                    # Only filter if IQR is positive to avoid issues with constant data
+                                    if iqr > 1e-9: # Use a small epsilon
+                                        lower_bound = q1 - self.iqr_k_factor * iqr
+                                        upper_bound = q3 + self.iqr_k_factor * iqr
+                                        mask = (filtered_displacements >= lower_bound) & (filtered_displacements <= upper_bound)
+                                        filtered_displacements = filtered_displacements[mask]
+                                        num_filtered = len(filtered_displacements)
+                                        # --- Add More Debugging ---
+                                        if num_filtered < num_original:
+                                             print(f"[IQR Debug Frame {i}] Filtered {num_original - num_filtered} outliers ({num_original} -> {num_filtered}). IQR={iqr:.3f}, Bounds=[{lower_bound:.3f}, {upper_bound:.3f}]")
+                                        elif num_filtered == 0:
+                                             print(f"[IQR Debug Frame {i}] Filtered ALL points ({num_original} -> 0). IQR={iqr:.3f}, Bounds=[{lower_bound:.3f}, {upper_bound:.3f}]")
+                                    # else: # Optional: Print if IQR was too small to filter
+                                    #     print(f"[IQR Debug Frame {i}] IQR <= 1e-9 ({iqr:.3f}), not filtering.")
+
+                                except Exception as e_iqr:
+                                    print(f"[SignalGenerator] Warning: IQR filter failed for ROI {i}: {e_iqr}")
+                                    # Fallback to original displacements on error
+                                    filtered_displacements = vertical_displacements
+                                    num_filtered = len(filtered_displacements) # Update count
+
+                            # --- *** CORRECTED: Aggregation happens *after* potential filtering *** ---
+                            # Check if any points remain *after* filtering
+                            if num_filtered > 0:
+                                if self.aggregation_method == 'mean':
+                                    signal_value = np.mean(filtered_displacements)
+                                    reason = f"Mean Vertical Disp ({num_filtered}/{num_original} pts)"
+                                else: # Default/Median
+                                    signal_value = np.median(filtered_displacements)
+                                    reason = f"Median Vertical Disp ({num_filtered}/{num_original} pts)"
                             else:
-                                # Fallback just in case (shouldn't be reached due to __init__ check)
-                                signal_value = np.median(vertical_displacements)
-                                reason = f"Median Vertical Disp (Fallback) ({num_points} pts)"
-                            # --- *** END AGGREGATION METHOD *** ---
+                                signal_value = 0.0 # No points left after filtering
+                                reason = f"No points left after IQR filter ({num_original} -> 0)"
+
+                            # Handle potential NaN if filtering removed all points or input was NaN
+                            if np.isnan(signal_value):
+                                signal_value = 0.0
+                                reason += " (NaN result -> 0.0)"
+
 
                         except Exception as e_calc:
                              print(f"[SignalGenerator] Error during {self.aggregation_method.capitalize()} Vertical Displacement calc for ROI {i}: {e_calc}")
@@ -168,6 +211,11 @@ if __name__ == '__main__':
         'SIGNAL_MIN_FEATURES_FOR_SIGNAL': 3,
         'SIGNAL_AGGREGATION_METHOD': 'mean' # Explicitly mean
     }
+    mock_config_median_iqr = {
+        'SIGNAL_MIN_FEATURES_FOR_SIGNAL': 3,
+        'SIGNAL_AGGREGATION_METHOD': 'median',
+        'IQR_FILTER_ENABLED': True, 'IQR_K_FACTOR': 1.5 # Enable IQR
+    }
     generator_median = SignalGenerator(config=mock_config_median)
     generator_mean = SignalGenerator(config=mock_config_mean)
 
@@ -184,9 +232,13 @@ if __name__ == '__main__':
     new5 = old5.copy() # dy = [0, 0, 0] -> mean=0, median=0
     old6 = np.array([[300, 300], [305, 301], [302, 299]], dtype=np.float32)
     new6 = old6 + np.array([1, 2], dtype=np.float32) # dy = [2, 2, 2] -> mean=2, median=2
+    # --- Data with outliers for IQR test ---
+    old7 = np.array([[10, 10], [15, 11], [12, 9], [18, 10], [5, 50], [25, -40]], dtype=np.float32)
+    new7 = np.array([[10, 12], [15, 13], [12, 11], [18, 12], [5, 55], [25, -35]], dtype=np.float32) # dy = [2, 2, 2, 2, 5, 5] -> Outliers 5, 5. Median should be 2.
 
     tracked_data_list = [
-        (old1, new1), (old2, new2), (old3, new3), (old4, new4), (old5, new5), (old6, new6)
+        (old1, new1), (old2, new2), (old3, new3), (old4, new4), (old5, new5), (old6, new6),
+        (old7, new7) # Add outlier data
     ]
 
     # --- Test Processing (Median) ---
@@ -222,5 +274,15 @@ if __name__ == '__main__':
     assert signals_mean[4] == 0.0, "Mean ROI 5 (constant points) should produce zero signal"
     assert np.isclose(signals_mean[5], 2.0), f"Mean ROI 6 (identical displacements) should produce signal 2.0, got {signals_mean[5]}"
     print("--- Mean Assertions Passed ---")
+
+    # --- Test Processing (Median with IQR) ---
+    print("\n--- Processing Mock Data (Median Aggregation with IQR Filter) ---")
+    generator_median_iqr = SignalGenerator(config=mock_config_median_iqr)
+    signals_median_iqr = generator_median_iqr.process_tracked_features(tracked_data_list)
+    print(f"Calculated Signals (Median w/ IQR): {signals_median_iqr}")
+    # Expected Median w/ IQR: [2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.0 (outliers 5, 5 removed)]
+    print("\n--- Running Assertions (Median w/ IQR) ---")
+    assert np.isclose(signals_median_iqr[6], 2.0), f"Median ROI 7 (IQR) expected ~2.0 (outliers removed), got {signals_median_iqr[6]}"
+    print("--- Median w/ IQR Assertions Passed ---")
 
     print("\nSignalGenerator module test finished.")
