@@ -22,7 +22,7 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QGroupBox, QFormLayout, QLabel, QDoubleSpinBox, QComboBox,
-        QPushButton, QSizePolicy, QSpacerItem, QFileDialog, QCheckBox, QMessageBox, QGridLayout
+        QPushButton, QSizePolicy, QSpacerItem, QFileDialog, QCheckBox, QMessageBox, QGridLayout, QLineEdit, QSpinBox
     )
     from PyQt6.QtCore import QTimer, Qt, pyqtSlot
     from PyQt6.QtGui import QFont
@@ -200,6 +200,10 @@ class TuningWindow(QMainWindow):
         self.is_playing = False
         self.playback_speed = 1.0 # Added playback speed multiplier
 
+        # Histogram range storage
+        self.hist_x_range = None
+        self.hist_y_range = None
+
         # --- Set Larger Font ---
         default_font = QApplication.font()
         default_point_size = default_font.pointSize()
@@ -273,8 +277,11 @@ class TuningWindow(QMainWindow):
         self.spectrum_plot_widget.getAxis('left').setTickFont(self.larger_font)
         self.raw_spectrum_curve = self.spectrum_plot_widget.plot(pen=pg.mkPen(color=(100, 100, 255, 150), width=1.5), name="Raw") # Slightly transparent blue
         self.filtered_spectrum_curve = self.spectrum_plot_widget.plot(pen=pg.mkPen(color=(100, 255, 100, 150), width=1.5), name="Filtered") # Slightly transparent green
-
-
+        # --- Add second curve for raw signal plot ---
+        self.raw_plot_curve_alt = self.raw_plot_widget.plot(pen=pg.mkPen(color=(255, 165, 0, 200), width=2), name="Median/Mean") # Orange, slightly transparent
+        # --- Add text item for peak frequency ---
+        self.peak_freq_text = pg.TextItem(anchor=(0, 1), color=(255, 255, 0)) # Yellow text, top-left anchor
+        self.spectrum_plot_widget.addItem(self.peak_freq_text)
         # --- End Plot Appearance Changes ---
 
 
@@ -282,7 +289,20 @@ class TuningWindow(QMainWindow):
         plot_layout.addWidget(self.filtered_plot_widget)
 
         main_layout.addWidget(plot_widget_container, 3) # Give plots more space
+        # --- Add Displacement Histogram Plot ---
+        self.disp_histogram_widget = pg.PlotWidget(title="Live Vertical Displacement Histogram")
+        self.disp_histogram_widget.setLabel('left', 'Count')
+        self.disp_histogram_widget.setLabel('bottom', 'Vertical Displacement (pixels)', color='white')
+        self.disp_histogram_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.disp_histogram_widget.getAxis('bottom').setTickFont(self.larger_font)
+        self.disp_histogram_widget.getAxis('left').setTickFont(self.larger_font)
+        # Initialize without data, stepMode will be handled by setData later
+        self.disp_histogram_curve = pg.PlotCurveItem(pen='y', fillLevel=0, brush=(255,255,0,80))
+        self.disp_histogram_widget.addItem(self.disp_histogram_curve)
+        # --- Disable auto-ranging for histogram ---
+        self.disp_histogram_widget.getViewBox().disableAutoRange()
         plot_layout.addWidget(self.spectrum_plot_widget) # Add spectrum plot below
+        plot_layout.addWidget(self.disp_histogram_widget) # Add histogram plot at the bottom
 
         # --- Controls Area ---
         controls_container = QWidget()
@@ -306,6 +326,13 @@ class TuningWindow(QMainWindow):
         self.speed_combo.setFont(self.larger_font)
         self.speed_combo.currentIndexChanged.connect(self._update_playback_speed)
         # --- End Playback Speed Control ---
+        # --- Frame Step Buttons ---
+        self.prev_frame_button = QPushButton("<")
+        self.prev_frame_button.clicked.connect(self._prev_frame)
+        self.next_frame_button = QPushButton(">")
+        self.next_frame_button.clicked.connect(self._next_frame)
+        self.prev_frame_button.setFont(self.larger_font)
+        self.next_frame_button.setFont(self.larger_font)
 
         playback_layout.addWidget(self.play_pause_button, 0, 0)
         playback_layout.addWidget(self.reset_button, 0, 1)
@@ -313,6 +340,8 @@ class TuningWindow(QMainWindow):
         playback_layout.addWidget(self.speed_combo, 1, 1)
         controls_layout.addWidget(playback_group)
         # Apply font to group box title
+        playback_layout.addWidget(self.prev_frame_button, 2, 0)
+        playback_layout.addWidget(self.next_frame_button, 2, 1)
         playback_group.setFont(self.larger_font)
 
         # --- Profile Management ---
@@ -347,6 +376,11 @@ class TuningWindow(QMainWindow):
         self.recalc_raw_checkbox = QCheckBox("Recalculate Raw Signal")
         self.recalc_raw_checkbox.setToolTip("Recalculate raw signal from feature points using selected method.")
         self.recalc_raw_checkbox.setFont(self.larger_font) # Apply font
+        self.recalc_raw_checkbox.setChecked(True) # Set to checked by default
+        # --- Add checkbox to compare mean/median ---
+        self.compare_agg_checkbox = QCheckBox("Compare Mean vs Median")
+        self.compare_agg_checkbox.setToolTip("When recalculating, show both mean (blue) and median (orange) raw signals.")
+        self.compare_agg_checkbox.setFont(self.larger_font) # Apply font
         sg_layout.addRow(self.recalc_raw_checkbox)
         sg_agg_label = QLabel("Aggregation:") # Create label explicitly
         sg_agg_label.setFont(self.larger_font) # Apply font
@@ -354,6 +388,7 @@ class TuningWindow(QMainWindow):
         controls_layout.addWidget(sg_group)
         # Apply font to group box title
         sg_group.setFont(self.larger_font)
+        sg_layout.addRow(self.compare_agg_checkbox) # Add the checkbox to the layout
 
         # Signal Processor Settings
         sp_group = QGroupBox("Signal Processing")
@@ -406,10 +441,26 @@ class TuningWindow(QMainWindow):
         self.plot_filtered_spectrum_check = QCheckBox("Plot Filtered Spectrum")
         self.plot_filtered_spectrum_check.setChecked(True) # Default to showing filtered
         self.plot_filtered_spectrum_check.setFont(self.larger_font)
+        # --- New Spectrum Controls ---
+        self.fft_padding_combo = QComboBox()
+        self.fft_padding_combo.addItems(["None", "2x", "4x", "8x", "8192"]) # Padding options
+        self.fft_padding_combo.setCurrentText("None")
+        self.fft_padding_combo.setFont(self.larger_font)
+        self.db_scale_check = QCheckBox("dB Scale")
+        self.db_scale_check.setFont(self.larger_font)
+        self.show_peak_freq_check = QCheckBox("Show Peak Freq (0.1-1.5Hz)")
+        self.show_peak_freq_check.setChecked(True)
+        self.show_peak_freq_check.setFont(self.larger_font)
+        # --- End New Spectrum Controls ---
         sa_layout.addRow("FFT Window Size:", self.fft_window_size_combo)
         sa_layout.addRow("FFT Window Type:", self.fft_window_type_combo)
-        sa_layout.addRow(self.plot_raw_spectrum_check)
-        sa_layout.addRow(self.plot_filtered_spectrum_check)
+        sa_layout.addRow("Padding:", self.fft_padding_combo)
+        sa_layout.addRow(self.db_scale_check) # Add dB Scale checkbox
+        sa_layout.addRow(self.plot_raw_spectrum_check, self.plot_filtered_spectrum_check) # Combine checkboxes
+        # --- Add Histogram Controls ---
+        self.hist_bins_spin = QSpinBox(minimum=5, maximum=100, value=20)
+        self.hist_bins_spin.setFont(self.larger_font)
+        sa_layout.addRow("Hist Bins:", self.hist_bins_spin)
         controls_layout.addWidget(sa_group)
         sa_group.setFont(self.larger_font)
         # --- End Spectrum Analyzer Settings ---
@@ -550,19 +601,18 @@ class TuningWindow(QMainWindow):
                 print(f"Error loading profile: {e}")
                 QMessageBox.critical(self, "Load Error", f"Failed to load profile:\n{filePath}\n\n{e}")
 
-    def _calculate_spectrum(self, signal_data, window_size, window_type):
+    def _calculate_spectrum(self, signal_data, window_size, window_type, padding_option="None", use_db_scale=False):
         """Calculates the frequency spectrum of the given signal data."""
         if signal_data is None or len(signal_data) < 2: # Need at least 2 points for FFT
-            return None, None # Not enough data
+            return None, None, None # Freq, Mag, Peak Freq
 
         # --- Adjust window size if it exceeds data length ---
         actual_window_size = min(window_size, len(signal_data))
         if actual_window_size != window_size:
             print(f"[Spectrum Debug] Warning: Requested FFT window size ({window_size}) > data length ({len(signal_data)}). Using {actual_window_size}.")
 
-        # Use the last 'window_size' points for the FFT
-        segment = signal_data[-window_size:]
-
+        # --- Use actual_window_size --- # Corrected comment, was using window_size before
+        segment = signal_data[-actual_window_size:] # Use adjusted size
         # Apply window function
         try:
             window_func = getattr(scipy_signal.windows, window_type)
@@ -574,10 +624,22 @@ class TuningWindow(QMainWindow):
             print(f"Error applying window function: {e}")
             # Continue without windowing
 
+        # --- Determine FFT size with padding ---
+        n_fft = actual_window_size
+        if padding_option == "None":
+            n_fft = actual_window_size
+        elif padding_option.endswith('x'):
+            try:
+                factor = int(padding_option.replace('x', ''))
+                n_fft = actual_window_size * factor
+            except ValueError: pass # Keep original size if parse fails
+        elif padding_option.isdigit():
+            n_fft = max(actual_window_size, int(padding_option)) # Use larger of window or specified padding
+
         # Calculate FFT
-        fft_result = np.fft.fft(segment)
+        fft_result = np.fft.fft(segment, n=n_fft) # Apply padding here
         # Calculate frequencies using adjusted size
-        frequencies = np.fft.fftfreq(actual_window_size, d=1.0/self.sampling_rate)
+        frequencies = np.fft.fftfreq(n_fft, d=1.0/self.sampling_rate) # Use n_fft for frequencies
 
         # Get magnitude and keep only positive frequencies (adjust mask size)
         magnitude = np.abs(fft_result)
@@ -586,10 +648,29 @@ class TuningWindow(QMainWindow):
         magnitude_pos = magnitude[positive_mask]
 
         # Normalize magnitude (optional, e.g., divide by window size)
-        magnitude_pos = magnitude_pos / window_size
         magnitude_pos = magnitude_pos / actual_window_size # Use adjusted size for normalization
-        return frequencies_pos, magnitude_pos
 
+        # --- Convert to dB if requested ---
+        if use_db_scale:
+            # Add small epsilon to prevent log(0)
+            magnitude_db = 20 * np.log10(magnitude_pos + 1e-12)
+            magnitude_to_return = magnitude_db
+        else:
+            magnitude_to_return = magnitude_pos
+
+        # --- Find Peak Frequency ---
+        peak_freq_hz = None
+        try:
+            # Define typical respiration frequency range
+            min_resp_hz = 0.1
+            max_resp_hz = 1.5
+            valid_range_mask = (frequencies_pos >= min_resp_hz) & (frequencies_pos <= max_resp_hz)
+            if np.any(valid_range_mask):
+                # Use linear magnitude (magnitude_pos) for finding the peak index, regardless of dB display
+                peak_index_in_range = np.argmax(magnitude_pos[valid_range_mask])
+                peak_freq_hz = frequencies_pos[valid_range_mask][peak_index_in_range]
+        except Exception as e_peak: print(f"Error finding peak frequency: {e_peak}")
+        return frequencies_pos, magnitude_to_return, peak_freq_hz
 
 
     @pyqtSlot()
@@ -613,7 +694,10 @@ class TuningWindow(QMainWindow):
                 print("Error: Feature coordinate data is missing or length mismatch.")
                 return
 
-            recalculated_raw = []
+            # --- Ensure these are indented inside the 'if' block ---
+            recalculated_raw_mean = []
+            recalculated_raw_median = []
+            all_displacements_per_frame = [] # Store displacements for histogram
             # Need pairs of frames for displacement
             for i in range(len(self.feature_coords) - 1):
                 # Simulate FeatureTracker output: (old_points, new_points)
@@ -628,18 +712,65 @@ class TuningWindow(QMainWindow):
                 # Basic matching by index (crude approximation)
                 min_len = min(len(old_p) if old_p is not None else 0, len(new_p) if new_p is not None else 0)
                 if min_len > 0:
-                    mock_tracked_data = [(old_p[:min_len], new_p[:min_len])]
-                    signal_list = self.signal_generator.process_tracked_features(mock_tracked_data)
-                    recalculated_raw.append(signal_list[0] if signal_list else 0.0)
+                    # --- Reshape points to (N, 2) before indexing ---
+                    old_p_2d = old_p[:min_len].reshape(-1, 2)
+                    new_p_2d = new_p[:min_len].reshape(-1, 2)
+                    displacements = new_p_2d[:, 1] - old_p_2d[:, 1] # Y_new - Y_old
+                    all_displacements_per_frame.append(displacements) # Store for histogram
+
+                    # Calculate mean and median
+                    mean_disp = np.mean(displacements) if len(displacements) > 0 else 0.0
+                    median_disp = np.median(displacements) if len(displacements) > 0 else 0.0
+
+                    # Append to respective lists (apply inversion like in pipeline_manager)
+                    recalculated_raw_mean.append(-mean_disp)
+                    recalculated_raw_median.append(-median_disp)
                 else:
-                    recalculated_raw.append(0.0)
+                    recalculated_raw_mean.append(0.0)
+                    recalculated_raw_median.append(0.0)
+                    all_displacements_per_frame.append(np.array([])) # Empty array for this frame
+
             # Pad the last frame signal (no displacement available)
-            recalculated_raw.append(recalculated_raw[-1] if recalculated_raw else 0.0)
-            self.raw_signal_processed = np.array(recalculated_raw)
-            print(f"Raw signal recalculated ({len(self.raw_signal_processed)} points).")
+            recalculated_raw_mean.append(recalculated_raw_mean[-1] if recalculated_raw_mean else 0.0)
+            recalculated_raw_median.append(recalculated_raw_median[-1] if recalculated_raw_median else 0.0)
+            all_displacements_per_frame.append(np.array([])) # Empty for last frame
+
+            # Store displacements for live histogram update
+            # --- Add attribute to store displacements ---
+
+            self._live_displacements = all_displacements_per_frame
+            # --- Calculate fixed histogram ranges ---
+            self._calculate_and_set_histogram_ranges()
+
+            # Decide which signal(s) to use based on checkboxes
+            compare_mode = self.compare_agg_checkbox.isChecked()
+            primary_method = self.aggMethod_combo.currentText()
+
+            if compare_mode:
+                # In compare mode, blue is mean, orange is median
+                self.raw_signal_processed = np.array(recalculated_raw_mean)
+                # --- Add attribute to store alt signal ---
+                self.raw_signal_alt_processed = np.array(recalculated_raw_median) # Store median in alt
+                print(f"Raw signals recalculated (Mean/Median Compare Mode).")
+            else:
+                # Use the selected primary method
+                if primary_method == "mean":
+                    self.raw_signal_processed = np.array(recalculated_raw_mean)
+                else: # Default to median
+                    self.raw_signal_processed = np.array(recalculated_raw_median)
+                self.raw_signal_alt_processed = None # No alternative signal
+                print(f"Raw signal recalculated using '{primary_method}'.")
+
+            # --- End Recalculation ---
+
         else:
-            # Use the originally loaded raw signal
+            # --- Ensure alt signal and displacements are None when not recalculating ---
+            # --- This block runs if checkbox is NOT checked ---
             self.raw_signal_processed = self.raw_signal_loaded.copy()
+            self.raw_signal_alt_processed = None # No alternative signal
+            # --- Clear histogram ranges if not recalculating ---
+            self._clear_histogram_ranges()
+            self._live_displacements = None # No live displacements available
             print("Using loaded raw signal.")
 
         # --- Process Raw Signal ---
@@ -658,11 +789,70 @@ class TuningWindow(QMainWindow):
         # --- Update Plots ---
         valid_timestamps = self.timestamps[:len(self.raw_signal_processed)] # Match length
         self.raw_plot_curve.setData(valid_timestamps, self.raw_signal_processed)
+        # --- Update alt raw curve if needed ---
+        if self.raw_signal_alt_processed is not None:
+            self.raw_plot_curve_alt.setData(valid_timestamps, self.raw_signal_alt_processed)
+        else:
+            self.raw_plot_curve_alt.clear() # Clear if not comparing
+
         self.filtered_plot_curve.setData(valid_timestamps, self.filtered_signal_processed)
         print("Plots updated.")
 
 
         self._reset_playback() # Reset cursor position after reprocessing
+
+    def _calculate_and_set_histogram_ranges(self):
+        """Calculates and sets fixed X/Y ranges for the histogram based on all frames."""
+        if self._live_displacements is None:
+            self._clear_histogram_ranges()
+            return
+
+        try:
+            # Flatten all valid, finite displacements
+            all_disp_flat = np.concatenate([
+                d[np.isfinite(d)] for d in self._live_displacements if d is not None and d.size > 0
+            ])
+
+            if all_disp_flat.size == 0:
+                print("[Hist Range] No valid displacement data found to calculate ranges.")
+                self._clear_histogram_ranges()
+                return
+
+            # Calculate X range (Displacement)
+            min_disp, max_disp = np.min(all_disp_flat), np.max(all_disp_flat)
+            padding_x = (max_disp - min_disp) * 0.05 # 5% padding
+            self.hist_x_range = (min_disp - padding_x, max_disp + padding_x)
+
+            # Calculate Y range (Max Count)
+            num_bins = self.hist_bins_spin.value()
+            max_y_count = 0
+            # Use the calculated fixed X range for consistent binning across frames
+            hist_range_param = (self.hist_x_range[0], self.hist_x_range[1])
+            for frame_displacements in self._live_displacements:
+                if frame_displacements is not None and frame_displacements.size > 0:
+                    finite_disp = frame_displacements[np.isfinite(frame_displacements)]
+                    if finite_disp.size > 0:
+                        hist_y, _ = np.histogram(finite_disp, bins=num_bins, range=hist_range_param)
+                        max_y_count = max(max_y_count, np.max(hist_y) if hist_y.size > 0 else 0)
+
+            self.hist_y_range = (0, max_y_count * 1.1) # 10% padding on top
+
+            # Apply ranges to the plot
+            self.disp_histogram_widget.setXRange(*self.hist_x_range, padding=0)
+            self.disp_histogram_widget.setYRange(*self.hist_y_range, padding=0)
+            print(f"[Hist Range] Set X range: {self.hist_x_range}, Y range: {self.hist_y_range}")
+        except Exception as e:
+            print(f"Error calculating histogram ranges: {e}")
+            self._clear_histogram_ranges() # Clear ranges on error
+
+    def _clear_histogram_ranges(self):
+        """Clears stored histogram ranges and potentially resets plot ranges."""
+        self.hist_x_range = None
+        self.hist_y_range = None
+        # Optionally reset plot ranges or let autoRange take over if re-enabled
+        # self.disp_histogram_widget.enableAutoRange() # Or set to default ranges
+        self.disp_histogram_curve.clear() # Clear data when ranges are invalid
+        print("[Hist Range] Cleared histogram ranges.")
 
     @pyqtSlot(bool)
     def _toggle_playback(self, checked):
@@ -671,7 +861,8 @@ class TuningWindow(QMainWindow):
             if self.timestamps is not None and len(self.timestamps) > 0:
                 self.is_playing = True
                 self.play_pause_button.setText("Pause")
-                self.playback_start_time = time.time() - (self.timestamps[self.current_frame_index] - self.timestamps[0])
+                # --- Adjust start time based on speed ---
+                self.playback_start_time = time.time() - (self.timestamps[self.current_frame_index] - self.timestamps[0]) / self.playback_speed
                 self.playback_timer.start(30) # Update cursor roughly 30 times/sec
                 print("Playback started.")
         else:
@@ -685,7 +876,12 @@ class TuningWindow(QMainWindow):
         """Updates the playback speed multiplier based on combo box selection."""
         speed_text = self.speed_combo.itemText(index) # e.g., "0.5x"
         try:
-            self.playback_speed = float(speed_text.replace('x', ''))
+            new_speed = float(speed_text.replace('x', ''))
+            if self.is_playing:
+                # Adjust start time to maintain current playback position
+                current_simulated_time = (time.time() - self.playback_start_time) * self.playback_speed
+                self.playback_start_time = time.time() - current_simulated_time / new_speed
+            self.playback_speed = new_speed
             print(f"Playback speed set to: {self.playback_speed}x")
         except ValueError:
             self.playback_speed = 1.0 # Default to 1x on error
@@ -694,14 +890,78 @@ class TuningWindow(QMainWindow):
     def _reset_playback(self):
         """Resets the playback cursor to the beginning."""
         self.current_frame_index = 0
-        if self.timestamps is not None and len(self.timestamps) > 0:
-            current_time = self.timestamps[0]
-            self.raw_time_cursor.setPos(current_time)
-            self.filtered_time_cursor.setPos(current_time)
-            self.feature_plot_window.update_plot(self.current_frame_index) # Update feature plot
+        self._update_plots_for_frame(self.current_frame_index) # Update all plots for frame 0
         if self.is_playing:
             self.playback_start_time = time.time() # Reset timer baseline
         print("Playback reset.")
+
+    def _update_histogram_plot(self):
+        """Updates the displacement histogram for the current frame."""
+        hist_x, hist_y = None, None # Initialize histogram data
+        displacements = None # Initialize displacements to None
+
+        try: # Outer try for initial checks
+            if self._live_displacements is None or not (0 <= self.current_frame_index < len(self._live_displacements)):
+                # --- DEBUG PRINT ---
+                print(f"[Hist Debug] Clearing histogram. _live_displacements is None: {self._live_displacements is None}, Index valid: {0 <= self.current_frame_index < (len(self._live_displacements) if self._live_displacements is not None else 0)}")
+                # displacements remains None
+            else:
+                # --- This block executes only if _live_displacements is valid ---
+                displacements = self._live_displacements[self.current_frame_index] # Get displacements for current frame
+
+            # Now, check the assigned (or None) displacements variable
+            if displacements is not None and len(displacements) > 0:
+                # --- FIX: Ensure displacements is a numeric array before using np.isfinite ---
+                try:
+                    # Attempt conversion to float, handling potential errors
+                    numeric_displacements = np.asarray(displacements, dtype=float)
+                except (ValueError, TypeError) as e_conv:
+                    print(f"[Hist Debug] Warning: Could not convert displacements to numeric array: {e_conv}")
+                    numeric_displacements = np.array([], dtype=float) # Use empty array on conversion failure
+
+                # Ensure displacements are finite before histogram calculation
+                finite_displacements = numeric_displacements[np.isfinite(numeric_displacements)]
+                if len(finite_displacements) > 0:
+                    num_bins = self.hist_bins_spin.value() # Use the UI value for bin count
+                    # Calculate histogram
+                    hist_y, hist_x = np.histogram(finite_displacements, bins=num_bins) # hist_x has len(hist_y)+1
+                    # --- DEBUG PRINT ---
+                    # print(f"[Hist Debug] Frame {self.current_frame_index}: Calculated hist_y (counts) = {hist_y}, hist_x (edges) = {hist_x}")
+                else:
+                    # --- DEBUG PRINT ---
+                    print("[Hist Debug] No finite displacements to create histogram.")
+                    # hist_x, hist_y remain None
+            else:
+                # --- DEBUG PRINT ---
+                if displacements is None:
+                     print("[Hist Debug] Displacements variable is None (likely due to invalid index or missing data).")
+                # hist_x, hist_y remain None
+        except Exception as e_hist_outer: # Catch errors during data access/checks
+            print(f"Error preparing histogram data: {e_hist_outer}")
+            traceback.print_exc() # Print traceback for unexpected errors
+            self.disp_histogram_curve.setData([], []) # Clear on error
+            return # Exit if data prep failed
+
+        try: # Inner try specifically for histogram calculation and plotting
+            # Check if histogram data is valid before plotting
+            if hist_x is not None and hist_y is not None and len(hist_x) == len(hist_y) + 1:
+                 # --- DEBUG PRINT ---
+                # print(f"[Hist Debug] Attempting setData with hist_x shape {hist_x.shape}, hist_y shape {hist_y.shape}")
+                 # Ensure data types are suitable for isfinite check later (should be by default from np.histogram)
+                hist_x = np.asanyarray(hist_x, dtype=float)
+                hist_y = np.asanyarray(hist_y, dtype=float)
+                # Set stepMode here when setting data
+                self.disp_histogram_curve.setData(hist_x, hist_y, stepMode="center") # Correctly applying stepMode here
+            else:
+                # Clear plot if data is invalid or empty
+                # --- DEBUG PRINT ---
+                # print(f"[Hist Debug] Clearing plot because hist_x or hist_y is invalid. hist_x is None: {hist_x is None}, hist_y is None: {hist_y is None}")
+                self.disp_histogram_curve.setData([], [])
+        except Exception as e_hist_plot: # Catch errors during setData or potential issues with hist data
+            print(f"Error updating histogram plot (setData): {e_hist_plot}") # Use e_hist_plot here
+            traceback.print_exc() # Print traceback for unexpected errors
+            self.disp_histogram_curve.setData([], []) # Clear on error
+
 
     def _update_playback_cursor(self):
         """Updates the position of the time cursor based on simulated time."""
@@ -715,54 +975,73 @@ class TuningWindow(QMainWindow):
 
         # Find the closest frame index
         # Use searchsorted for efficiency
-        self.current_frame_index = np.searchsorted(self.timestamps, target_timestamp, side='right') - 1
-        self.current_frame_index = max(0, self.current_frame_index) # Ensure non-negative
+        new_frame_index = np.searchsorted(self.timestamps, target_timestamp, side='right') - 1
+        new_frame_index = max(0, new_frame_index) # Ensure non-negative
 
         # Loop playback
-        if self.current_frame_index >= len(self.timestamps) - 1:
-            self.current_frame_index = 0
+        if new_frame_index >= len(self.timestamps) - 1:
+            new_frame_index = 0
             # Reset timer baseline accounting for speed
             self.playback_start_time = time.time()
-            current_time = self.timestamps[0]
-        else:
-            current_time = self.timestamps[self.current_frame_index]
+
+        # Update only if the index actually changed to avoid redundant calculations
+        # and prevent unnecessary updates when looping back to 0
+        if new_frame_index != self.current_frame_index:
+            # Call the central plot update function
+            self._update_plots_for_frame(new_frame_index)
+
+    def _update_plots_for_frame(self, frame_index):
+        """Updates time cursors, feature plot, histogram, and spectrum for a specific frame."""
+        if self.timestamps is None or not (0 <= frame_index < len(self.timestamps)):
+            print(f"[Plot Update] Invalid frame index: {frame_index}")
+            return
+
+        self.current_frame_index = frame_index
+        current_time = self.timestamps[self.current_frame_index]
 
         # Update cursor positions
         self.raw_time_cursor.setPos(current_time)
         self.filtered_time_cursor.setPos(current_time)
 
-        # --- Update feature plot window ---
+        # Update feature plot window
         self.feature_plot_window.update_plot(self.current_frame_index)
 
-        # --- Live Spectrum Update ---
+        # Update displacement histogram
+        self._update_histogram_plot()
+
+        # Update Spectrum Plot (using the same logic as in _update_playback_cursor)
         try:
             fft_win_size = int(self.fft_window_size_combo.currentText())
             fft_win_type = self.fft_window_type_combo.currentText()
+            padding_opt = self.fft_padding_combo.currentText()
+            use_db = self.db_scale_check.isChecked()
 
-            # Get signal segment ending at current index
             start_index = max(0, self.current_frame_index + 1 - fft_win_size)
             end_index = self.current_frame_index + 1
 
-            # Clear previous curves
             self.raw_spectrum_curve.clear()
             self.filtered_spectrum_curve.clear()
 
+            peak_freq_raw, peak_freq_filt = None, None
+
             if self.plot_raw_spectrum_check.isChecked() and self.raw_signal_processed is not None:
                 raw_segment = self.raw_signal_processed[start_index:end_index]
-                freq_raw, mag_raw = self._calculate_spectrum(raw_segment, fft_win_size, fft_win_type)
-                if freq_raw is not None:
-                    self.raw_spectrum_curve.setData(freq_raw, mag_raw)
+                freq_raw, mag_raw, peak_freq_raw = self._calculate_spectrum(raw_segment, fft_win_size, fft_win_type, padding_opt, use_db)
+                if freq_raw is not None: self.raw_spectrum_curve.setData(freq_raw, mag_raw)
 
             if self.plot_filtered_spectrum_check.isChecked() and self.filtered_signal_processed is not None:
                 filtered_segment = self.filtered_signal_processed[start_index:end_index]
-                freq_filt, mag_filt = self._calculate_spectrum(filtered_segment, fft_win_size, fft_win_type)
-                if freq_filt is not None:
-                    self.filtered_spectrum_curve.setData(freq_filt, mag_filt)
+                freq_filt, mag_filt, peak_freq_filt = self._calculate_spectrum(filtered_segment, fft_win_size, fft_win_type, padding_opt, use_db)
+                if freq_filt is not None: self.filtered_spectrum_curve.setData(freq_filt, mag_filt)
 
-            # Ensure frequency range is still limited
-            self.spectrum_plot_widget.setXRange(0, 3, padding=0)
-        except Exception as e_spec_live:
-            print(f"Error updating live spectrum: {e_spec_live}")
+            if self.show_peak_freq_check.isChecked():
+                peak_text = ""
+                if peak_freq_filt is not None and self.plot_filtered_spectrum_check.isChecked(): peak_text = f"Peak (Filt): {peak_freq_filt:.2f} Hz ({peak_freq_filt*60:.1f} BPM)"
+                elif peak_freq_raw is not None and self.plot_raw_spectrum_check.isChecked(): peak_text = f"Peak (Raw): {peak_freq_raw:.2f} Hz ({peak_freq_raw*60:.1f} BPM)"
+                self.peak_freq_text.setText(peak_text)
+            else: self.peak_freq_text.setText("")
+        except Exception as e_spec_update:
+            print(f"Error updating spectrum for frame {frame_index}: {e_spec_update}")
 
     @pyqtSlot()
     def _save_profile_as(self):
@@ -783,6 +1062,30 @@ class TuningWindow(QMainWindow):
             except Exception as e:
                 print(f"Error saving profile: {e}")
                 QMessageBox.critical(self, "Save Error", f"Failed to save profile:\n{filePath}\n\n{e}")
+
+    @pyqtSlot()
+    def _prev_frame(self):
+        """Steps to the previous frame."""
+        if self.timestamps is None or len(self.timestamps) == 0: return
+        if self.is_playing: # Pause if playing
+            self.play_pause_button.setChecked(False) # This triggers _toggle_playback
+
+        new_index = max(0, self.current_frame_index - 1)
+        if new_index != self.current_frame_index:
+            self._update_plots_for_frame(new_index)
+            print(f"Stepped back to frame {new_index}")
+
+    @pyqtSlot()
+    def _next_frame(self):
+        """Steps to the next frame."""
+        if self.timestamps is None or len(self.timestamps) == 0: return
+        if self.is_playing: # Pause if playing
+            self.play_pause_button.setChecked(False) # This triggers _toggle_playback
+
+        new_index = min(len(self.timestamps) - 1, self.current_frame_index + 1)
+        if new_index != self.current_frame_index:
+            self._update_plots_for_frame(new_index)
+            print(f"Stepped forward to frame {new_index}")
 
     def closeEvent(self, event):
         """Stops timer on close."""
