@@ -38,6 +38,8 @@ if src_dir not in sys.path:
 # --- Import UI and Backend Components ---
 try:
     from ui.main_window import MainWindow # Import the UI class
+    from ui.visualizer import SignalVisualizer # <<< Import the new visualizer
+
     try:
         from video_input import VideoInput
     except ImportError:
@@ -86,6 +88,7 @@ class PipelineWorker(QObject):
     new_frame_ready = pyqtSignal(np.ndarray)
     new_plot_data = pyqtSignal(list)
     new_status = pyqtSignal(float, bool, int)
+    new_filtered_signal_value = pyqtSignal(float) # <<< Signal for the visualizer
     processing_error = pyqtSignal(str)
     finished = pyqtSignal()
     setup_finished = pyqtSignal(bool, str)
@@ -422,12 +425,19 @@ class PipelineWorker(QObject):
 
         # --- Process one frame ---
         try:
+            # --- Expanded Timing Start ---
+            t_cycle_start = time.perf_counter()
+
             # Calculate time since last loop start for FPS control
             frame_start_time = time.perf_counter()
             time_since_last_loop = frame_start_time - self._loop_start_time
             self._loop_start_time = frame_start_time # Reset for next iteration
 
+            t_grab_start = time.perf_counter()
             success, frame = self.video_input.get_frame()
+            t_grab_end = time.perf_counter()
+            t_frame_grab_ms = (t_grab_end - t_grab_start) * 1000
+
             if not success or frame is None:
                 print("[Worker] End of video source or cannot read frame. Stopping.")
                 self._running = False
@@ -437,6 +447,7 @@ class PipelineWorker(QObject):
                 self.finished.emit()
                 return
 
+            t_draw_overlays_ms = 0.0 # Initialize overlay drawing time
             processed_frame = frame.copy()
             results = None
             current_tracked_points = None
@@ -450,6 +461,7 @@ class PipelineWorker(QObject):
                     if self._running: self.run_timer.start(50)
                     return
 
+                t_preview_proc_start = time.perf_counter()
                 image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image_rgb.flags.writeable = False
                 self.latest_landmarks = self.pose_detector.process_frame(image_rgb)
@@ -461,14 +473,28 @@ class PipelineWorker(QObject):
                 else:
                     self.latest_preview_roi = []
 
+                t_preview_proc_end = time.perf_counter()
+                t_preview_overhead_ms = (t_preview_proc_end - t_preview_proc_start) * 1000
+
                 # Draw overlays for preview
+                t_overlay_start = time.perf_counter()
                 if self.show_pose and self.latest_landmarks:
                     mp_drawing.draw_landmarks(processed_frame, self.latest_landmarks, mp_pose.POSE_CONNECTIONS, landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
                 if self.show_roi and self.latest_preview_roi:
                     for (x, y, w, h) in self.latest_preview_roi:
                         cv2.rectangle(processed_frame, (x, y), (x + w, y + h), (0, 255, 255), 2) # Cyan ROI
+                t_overlay_end = time.perf_counter()
+                t_draw_overlays_ms = (t_overlay_end - t_overlay_start) * 1000
 
-                # Emit preview results
+                # --- Emit preview results ---
+                # --- Expanded Timing Calculation for Preview ---
+                t_cycle_end = time.perf_counter()
+                t_worker_cycle_ms = (t_cycle_end - t_cycle_start) * 1000
+                print(f"[Timing Preview (ms)] Grab: {t_frame_grab_ms:.1f}, "
+                      f"Pose/ROI: {t_preview_overhead_ms:.1f}, "
+                      f"Draw: {t_draw_overlays_ms:.1f}, "
+                      f"CycleTotal: {t_worker_cycle_ms:.1f}")
+
                 self.new_frame_ready.emit(processed_frame)
                 self.new_plot_data.emit([]) # No plot data in preview
                 self.new_status.emit(0.0, False, SignalProcessor.PHASE_UNKNOWN) # No status in preview
@@ -500,6 +526,7 @@ class PipelineWorker(QObject):
                     current_tracked_points = results.get('tracked_points') # Adjust key if needed
 
                 # --- Draw Tracking Overlays ---
+                t_overlay_start = time.perf_counter()
                 # Draw locked ROI
                 if self.show_roi and self.locked_roi:
                     for (x, y, w, h) in self.locked_roi:
@@ -531,18 +558,33 @@ class PipelineWorker(QObject):
                         except Exception as draw_err:
                             print(f"!!! ERROR during feature drawing loop: {draw_err}")
                             traceback.print_exc() # Print full traceback for drawing errors
+                t_overlay_end = time.perf_counter()
+                t_draw_overlays_ms = (t_overlay_end - t_overlay_start) * 1000
 
                 # --- Emit Tracking Results ---
+                # --- Expanded Timing Calculation for Tracking ---
+                t_cycle_end = time.perf_counter()
+                t_worker_cycle_ms = (t_cycle_end - t_cycle_start) * 1000
+
                 self.new_frame_ready.emit(processed_frame)
                 if results:
                     # --- ADD PRINT STATEMENT FOR TIMING ---
                     if 'timing_ms' in results:
-                        timings = results['timing_ms']
-                        print(f"[Timing (ms)] FT: {timings.get('feature_tracker', 0):.1f}, "
-                              f"SG: {timings.get('signal_generator', 0):.1f}, "
-                              f"SP: {timings.get('signal_processor', 0):.1f}, "
-                              f"Total: {timings.get('total_pipeline', 0):.1f}")
+                        pipeline_timings = results['timing_ms']
+                        # Print expanded timings
+                        print(f"[Timing (ms)] Grab: {t_frame_grab_ms:.1f}, "
+                              f"FT: {pipeline_timings.get('feature_tracker', 0):.1f}, "
+                              f"SG: {pipeline_timings.get('signal_generator', 0):.1f}, "
+                              f"SP: {pipeline_timings.get('signal_processor', 0):.1f}, "
+                              f"Draw: {t_draw_overlays_ms:.1f}, "
+                              f"PipeTotal: {pipeline_timings.get('total_pipeline', 0):.1f}, "
+                              f"CycleTotal: {t_worker_cycle_ms:.1f}")
                     # --- END PRINT STATEMENT ---
+
+                    # --- Emit latest filtered value for visualizer ---
+                    latest_val = results.get('latest_filtered_value', 0.0)
+                    self.new_filtered_signal_value.emit(latest_val)
+                    # ---
 
                     # Emit plot data and status (adjust based on your reverted SignalProcessor interface)
                     # Example using get methods from the reverted pipeline_manager context:
@@ -793,6 +835,7 @@ if __name__ == "__main__":
 
     # --- Create UI and Worker ---
     main_window = MainWindow(config_file=config_file, profiles_dir=PROFILES_DIR)
+    visualizer_window = SignalVisualizer() # <<< Create visualizer instance
     worker = PipelineWorker(config_path=config_file) # Pass initial config path
     worker_thread = QThread()
     worker.moveToThread(worker_thread)
@@ -802,6 +845,7 @@ if __name__ == "__main__":
     worker.new_frame_ready.connect(main_window.update_webcam_feed)
     worker.new_plot_data.connect(main_window.update_plot)
     worker.new_status.connect(main_window.update_status_labels)
+    worker.new_filtered_signal_value.connect(visualizer_window.update_signal) # <<< Connect visualizer
     worker.processing_error.connect(main_window.show_error_message)
     worker.setup_finished.connect(main_window.handle_worker_setup_finished)
     worker.component_initialized.connect(main_window.handle_component_initialized)
@@ -842,6 +886,7 @@ if __name__ == "__main__":
 
     # --- Start Application ---
     main_window.show()
+    visualizer_window.show() # <<< Show the visualizer window
     # Start the worker thread's event loop
     # Use QTimer for a slightly delayed start to ensure the main event loop is running
     QTimer.singleShot(100, worker_thread.start)

@@ -157,6 +157,7 @@ class PipelineManager:
         filtered_signal_history = self.signal_processor.get_filtered_signal_buffer()
         raw_signal_history = self.signal_processor.get_raw_signal_buffer()
         peak_indices = self.signal_processor.get_last_peak_indices()
+        latest_filtered_value = self.signal_processor.get_latest_filtered_value() # <<< Get latest value
 
         end_time = time.time()
         processing_time = end_time - start_time
@@ -170,6 +171,8 @@ class PipelineManager:
             'raw_signal_history': raw_signal_history,
             'peak_indices': peak_indices,
             'processing_time': processing_time,
+            'latest_filtered_value': latest_filtered_value, # <<< Add value to results
+
             # --- Add timing results (in milliseconds) ---
             'timing_ms': {
                 'feature_tracker': t_feature_tracker,

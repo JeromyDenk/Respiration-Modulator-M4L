@@ -319,7 +319,12 @@ class SignalProcessor:
         """Returns the indices of peaks found in the last processed buffer."""
         # Return indices relative to the start of the buffer
         return self.last_peak_indices
-
+    def get_latest_filtered_value(self):
+            """Returns the most recent filtered signal value."""
+            if self.filtered_signal_buffer:
+                return self.filtered_signal_buffer[-1]
+            else:
+                return 0.0
 
 # Example usage (for testing this module directly)
 if __name__ == '__main__':
