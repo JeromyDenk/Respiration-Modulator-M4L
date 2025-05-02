@@ -14,6 +14,7 @@ import time
 import numpy as np
 import traceback
 import argparse
+from scipy import signal as scipy_signal # For window functions
 import json
 
 # --- PyQt6 Imports ---
@@ -262,6 +263,18 @@ class TuningWindow(QMainWindow):
         self.filtered_plot_widget.setXLink(self.raw_plot_widget)
         # Apply font to bottom axis ticks (only need to set on one linked axis)
         self.filtered_plot_widget.getAxis('bottom').setTickFont(self.larger_font)
+
+        # --- Spectrum Plot ---
+        self.spectrum_plot_widget = pg.PlotWidget(title="Frequency Spectrum")
+        self.spectrum_plot_widget.setLabel('left', 'Magnitude')
+        self.spectrum_plot_widget.setLabel('bottom', 'Frequency (Hz)', color='white')
+        self.spectrum_plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.spectrum_plot_widget.getAxis('bottom').setTickFont(self.larger_font)
+        self.spectrum_plot_widget.getAxis('left').setTickFont(self.larger_font)
+        self.raw_spectrum_curve = self.spectrum_plot_widget.plot(pen=pg.mkPen(color=(100, 100, 255, 150), width=1.5), name="Raw") # Slightly transparent blue
+        self.filtered_spectrum_curve = self.spectrum_plot_widget.plot(pen=pg.mkPen(color=(100, 255, 100, 150), width=1.5), name="Filtered") # Slightly transparent green
+
+
         # --- End Plot Appearance Changes ---
 
 
@@ -269,6 +282,7 @@ class TuningWindow(QMainWindow):
         plot_layout.addWidget(self.filtered_plot_widget)
 
         main_layout.addWidget(plot_widget_container, 3) # Give plots more space
+        plot_layout.addWidget(self.spectrum_plot_widget) # Add spectrum plot below
 
         # --- Controls Area ---
         controls_container = QWidget()
@@ -373,6 +387,33 @@ class TuningWindow(QMainWindow):
         sp_layout.labelForField(self.filtLow_spin).setFont(self.larger_font)
         sp_layout.labelForField(self.filtHigh_spin).setFont(self.larger_font)
         sp_layout.labelForField(self.filtType_combo).setFont(self.larger_font)
+
+                # --- Spectrum Analyzer Settings ---
+        sa_group = QGroupBox("Spectrum Analyzer")
+        sa_layout = QFormLayout(sa_group)
+        self.fft_window_size_combo = QComboBox()
+        # Populate with powers of 2, relative to sampling rate? Or fixed sizes? Let's use fixed sizes for now.
+        self.fft_window_size_combo.addItems(["256", "512", "1024", "2048", "4096"])
+        self.fft_window_size_combo.setCurrentText("1024")
+        self.fft_window_size_combo.setFont(self.larger_font)
+        self.fft_window_type_combo = QComboBox()
+        self.fft_window_type_combo.addItems(["hann", "hamming", "blackman", "boxcar"]) # Common window types
+        self.fft_window_type_combo.setCurrentText("hann")
+        self.fft_window_type_combo.setFont(self.larger_font)
+        self.plot_raw_spectrum_check = QCheckBox("Plot Raw Spectrum")
+        self.plot_raw_spectrum_check.setChecked(False)
+        self.plot_raw_spectrum_check.setFont(self.larger_font)
+        self.plot_filtered_spectrum_check = QCheckBox("Plot Filtered Spectrum")
+        self.plot_filtered_spectrum_check.setChecked(True) # Default to showing filtered
+        self.plot_filtered_spectrum_check.setFont(self.larger_font)
+        sa_layout.addRow("FFT Window Size:", self.fft_window_size_combo)
+        sa_layout.addRow("FFT Window Type:", self.fft_window_type_combo)
+        sa_layout.addRow(self.plot_raw_spectrum_check)
+        sa_layout.addRow(self.plot_filtered_spectrum_check)
+        controls_layout.addWidget(sa_group)
+        sa_group.setFont(self.larger_font)
+        # --- End Spectrum Analyzer Settings ---
+
 
         # Apply Button
         self.apply_button = QPushButton("Apply Settings & Reprocess")
@@ -509,6 +550,48 @@ class TuningWindow(QMainWindow):
                 print(f"Error loading profile: {e}")
                 QMessageBox.critical(self, "Load Error", f"Failed to load profile:\n{filePath}\n\n{e}")
 
+    def _calculate_spectrum(self, signal_data, window_size, window_type):
+        """Calculates the frequency spectrum of the given signal data."""
+        if signal_data is None or len(signal_data) < 2: # Need at least 2 points for FFT
+            return None, None # Not enough data
+
+        # --- Adjust window size if it exceeds data length ---
+        actual_window_size = min(window_size, len(signal_data))
+        if actual_window_size != window_size:
+            print(f"[Spectrum Debug] Warning: Requested FFT window size ({window_size}) > data length ({len(signal_data)}). Using {actual_window_size}.")
+
+        # Use the last 'window_size' points for the FFT
+        segment = signal_data[-window_size:]
+
+        # Apply window function
+        try:
+            window_func = getattr(scipy_signal.windows, window_type)
+            window = window_func(actual_window_size) # Use adjusted size
+            segment = segment * window
+        except AttributeError:
+            print(f"Warning: Unknown window type '{window_type}'. Using boxcar (no window).")
+        except Exception as e:
+            print(f"Error applying window function: {e}")
+            # Continue without windowing
+
+        # Calculate FFT
+        fft_result = np.fft.fft(segment)
+        # Calculate frequencies using adjusted size
+        frequencies = np.fft.fftfreq(actual_window_size, d=1.0/self.sampling_rate)
+
+        # Get magnitude and keep only positive frequencies (adjust mask size)
+        magnitude = np.abs(fft_result)
+        positive_mask = frequencies >= 0
+        frequencies_pos = frequencies[positive_mask]
+        magnitude_pos = magnitude[positive_mask]
+
+        # Normalize magnitude (optional, e.g., divide by window size)
+        magnitude_pos = magnitude_pos / window_size
+        magnitude_pos = magnitude_pos / actual_window_size # Use adjusted size for normalization
+        return frequencies_pos, magnitude_pos
+
+
+
     @pyqtSlot()
     def _reprocess_data(self):
         """Applies current settings and reprocesses the entire dataset."""
@@ -577,6 +660,8 @@ class TuningWindow(QMainWindow):
         self.raw_plot_curve.setData(valid_timestamps, self.raw_signal_processed)
         self.filtered_plot_curve.setData(valid_timestamps, self.filtered_signal_processed)
         print("Plots updated.")
+
+
         self._reset_playback() # Reset cursor position after reprocessing
 
     @pyqtSlot(bool)
@@ -648,6 +733,36 @@ class TuningWindow(QMainWindow):
 
         # --- Update feature plot window ---
         self.feature_plot_window.update_plot(self.current_frame_index)
+
+        # --- Live Spectrum Update ---
+        try:
+            fft_win_size = int(self.fft_window_size_combo.currentText())
+            fft_win_type = self.fft_window_type_combo.currentText()
+
+            # Get signal segment ending at current index
+            start_index = max(0, self.current_frame_index + 1 - fft_win_size)
+            end_index = self.current_frame_index + 1
+
+            # Clear previous curves
+            self.raw_spectrum_curve.clear()
+            self.filtered_spectrum_curve.clear()
+
+            if self.plot_raw_spectrum_check.isChecked() and self.raw_signal_processed is not None:
+                raw_segment = self.raw_signal_processed[start_index:end_index]
+                freq_raw, mag_raw = self._calculate_spectrum(raw_segment, fft_win_size, fft_win_type)
+                if freq_raw is not None:
+                    self.raw_spectrum_curve.setData(freq_raw, mag_raw)
+
+            if self.plot_filtered_spectrum_check.isChecked() and self.filtered_signal_processed is not None:
+                filtered_segment = self.filtered_signal_processed[start_index:end_index]
+                freq_filt, mag_filt = self._calculate_spectrum(filtered_segment, fft_win_size, fft_win_type)
+                if freq_filt is not None:
+                    self.filtered_spectrum_curve.setData(freq_filt, mag_filt)
+
+            # Ensure frequency range is still limited
+            self.spectrum_plot_widget.setXRange(0, 3, padding=0)
+        except Exception as e_spec_live:
+            print(f"Error updating live spectrum: {e_spec_live}")
 
     @pyqtSlot()
     def _save_profile_as(self):
