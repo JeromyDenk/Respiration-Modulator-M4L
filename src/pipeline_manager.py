@@ -132,12 +132,18 @@ class PipelineManager:
 
         # --- 3. Signal Generation ---
         raw_signals = []
+        raw_signal_for_recording = None # Initialize variable to store raw signal
         # Check if tracked_data is valid before proceeding
         if tracked_data and tracked_data[0] is not None: # Check if tracking produced data
             try:
                 t_start_sg = time.perf_counter()
                 # Assuming process_tracked_features is the correct method in the reverted version
                 raw_signals = self.signal_generator.process_tracked_features(tracked_data)
+                # --- Invert the raw signal(s) ---
+                if raw_signals: # Check if list is not empty
+                    raw_signals = [-s for s in raw_signals] # Multiply each element by -1
+                    # Store the first raw signal (assuming single ROI for now) for recording
+                    raw_signal_for_recording = raw_signals[0] if raw_signals else None
                 t_end_sg = time.perf_counter()
                 t_signal_gen = (t_end_sg - t_start_sg) * 1000 # Duration in ms
             except Exception as e_siggen: print(f"[PipelineManager] Error during signal generation: {e_siggen}"); traceback.print_exc(); raw_signals = [0.0] * len(tracked_data)
@@ -182,7 +188,8 @@ class PipelineManager:
             },
             'recalibration_run_this_frame': False, 'recalibration_succeeded': False,
             'frame_count': self.frame_count,
-            'tracked_points': current_tracked_points # <<< ADDED tracked points
+            'tracked_points': current_tracked_points, # Tracked points (already present)
+            'raw_signal': raw_signal_for_recording    # <<< ADDED raw signal
         }
         return results
 

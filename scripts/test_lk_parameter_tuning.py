@@ -16,6 +16,7 @@ import copy # To deep copy parameter dictionaries
 import collections # For signal processor buffers and trace history
 from scipy.fft import fft, fftfreq # For frequency plot (function kept, plot removed)
 import json # To load profile
+from PyQt6.QtWidgets import QApplication # <<< Import QApplication
 
 # --- Add src directory to Python path ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +41,7 @@ try:
     from feature_tracker import FeatureTracker
     from signal_generator import SignalGenerator
     from signal_processor import SignalProcessor
+    from ui.visualizer import SignalVisualizer # <<< Import the visualizer
 except ImportError as e:
     print(f"Error importing modules from 'src': {e}")
     print("Please ensure required modules exist (VideoInput, CoarseRoiCalculator, etc.).")
@@ -82,6 +84,9 @@ FONT_SCALE_PARAMS = 0.5
 FONT_SCALE_PLOT_TITLE = 0.5
 FONT_SCALE_PLOT_AXIS = 0.4
 FONT_THICKNESS = 1 # Use thickness 1 for smaller fonts
+
+# --- Initialize QApplication (MUST be done before creating QWidgets) ---
+app = QApplication(sys.argv) # <<< Create QApplication instance
 
 # --- Window Names & Display Size ---
 LK_WINDOW_NAME = 'LK Tuning (Video & LK Params)' # Main window for LK
@@ -220,6 +225,7 @@ except Exception as e_sig_init: print(f"ERROR initializing signal components: {e
 # --- Create Windows and Trackbars ---
 cv2.namedWindow(LK_WINDOW_NAME)
 cv2.namedWindow(SIGNAL_WINDOW_NAME) # Create the second window
+visualizer_window = SignalVisualizer() # <<< Create visualizer instance
 
 def nothing(x): pass # Dummy callback
 
@@ -241,9 +247,11 @@ initial_prominence_tb = min(4000, max(0, int(initial_prominence * 1000)))
 cv2.createTrackbar('Peak Prom*1000', SIGNAL_WINDOW_NAME, initial_prominence_tb, 4000, nothing)
 
 
+visualizer_window.show() # <<< Show the visualizer window
 # --- Tuning Loop ---
 prev_time = time.time(); frame_count = 0; feature_tracker = None
 prev_lk_params = {} # Store previous LK slider values
+visualize_raw_signal = False # <<< State variable for visualizer toggle
 prev_signal_params = {} # Store previous Signal slider values
 last_saved_params = {}
 mean_disp_history_len = int(MEAN_DISP_HISTORY_SECONDS * sampling_rate)
@@ -392,6 +400,7 @@ while True:
     filtered_signal_history = [] if not signal_processor else signal_processor.get_filtered_signal_buffer()
     peak_indices = [] if not signal_processor else signal_processor.get_last_peak_indices()
     # Use the new variable holding the successfully tracked points from the current frame
+    latest_filtered_value = 0.0 if not signal_processor else signal_processor.get_latest_filtered_value() # <<< Get latest value
     tracked_points_current = points_for_display # <<< USE the correct variable
 
 
@@ -461,6 +470,18 @@ while True:
     cv2.imshow(LK_WINDOW_NAME, display_frame) # Show LK window with video
     cv2.imshow(SIGNAL_WINDOW_NAME, plot_canvas) # Show Signal window with plots
 
+    # --- Select signal for visualizer based on toggle state ---
+    if visualize_raw_signal and raw_signal_history:
+        signal_for_visualizer = raw_signal_history[-1] # Use latest raw value
+    else:
+        signal_for_visualizer = latest_filtered_value # Use latest filtered value
+
+    # --- Update Visualizer ---
+    visualizer_window.update_signal(signal_for_visualizer) # <<< Update visualizer with selected signal
+
+    # --- Process Qt Events ---
+    app.processEvents() # <<< Allow the visualizer window to update
+
     # --- User Input ---
     key = cv2.waitKey(5) & 0xFF
     if key == ord('q'): print("Exit key pressed."); break
@@ -504,9 +525,18 @@ while True:
             last_saved_params = {**current_lk_params, **current_signal_params}
 
         except Exception as e_save: print(f"ERROR saving parameters to {config_path}: {e_save}"); traceback.print_exc()
+    elif key == ord('v'): # Toggle visualizer signal type
+        visualize_raw_signal = not visualize_raw_signal
+        print(f"Visualizer set to display: {'Raw Signal' if visualize_raw_signal else 'Filtered Signal'}")
+
+    # --- Check if visualizer window was closed ---
+    if not visualizer_window.isVisible():
+        print("Visualizer window closed. Exiting.")
+        break
 
 # --- Cleanup ---
 print("Releasing resources...")
 if video_input: video_input.release()
+if visualizer_window: visualizer_window.close() # <<< Close visualizer window
 cv2.destroyAllWindows()
 print("Finished.")

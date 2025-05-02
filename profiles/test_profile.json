@@ -1,6 +1,7 @@
 {
   "profile_name": "Test Profile with Tuned LK Params and 1080p",
   "description": "Configuration using LK parameters found via slider tuning, requesting 1080p resolution. EVM enabled.",
+  "enable_raw_data_recording": true,
   "video_input": {
     "VIDEO_SOURCE": 0,
     "VIDEO_WIDTH": 1920,

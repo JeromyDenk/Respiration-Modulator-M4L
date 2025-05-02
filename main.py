@@ -16,6 +16,8 @@ import cv2 # Needed for VideoCapture fallback
 import mediapipe as mp # Needed for drawing landmarks
 import copy # For deepcopy
 import threading # <<< IMPORT THREADING
+import multiprocessing as mp_proc # Use alias to avoid confusion with mediapipe
+from datetime import datetime # For recording directory names
 
 # --- PyQt6 Imports ---
 try:
@@ -53,6 +55,7 @@ try:
     from feature_tracker import FeatureTracker # Import for re-init
     from signal_generator import SignalGenerator # Import for re-init
 
+    from raw_data_recorder import DataRecorder # Import the recorder class
 except ImportError as e:
     print(f"Fatal Error: Failed to import necessary modules from 'src' or 'src/ui': {e}")
     traceback.print_exc(); sys.exit(1)
@@ -64,6 +67,7 @@ except Exception as e_general:
 # --- Constants ---
 DEFAULT_PROFILE = "test_profile.json"
 PROFILES_DIR = os.path.join(script_dir, "profiles")
+RECORDINGS_DIR = os.path.join(script_dir, "recordings") # Base dir for recordings
 
 # --- MediaPipe Drawing Utilities (for worker) ---
 mp_drawing = mp.solutions.drawing_utils
@@ -119,12 +123,17 @@ class PipelineWorker(QObject):
         self.show_features = False # Default based on UI
         # --- Timer ---
         self.run_timer = QTimer(self) # Timer to drive the run loop
-        # --- MODIFIED: Explicitly set DirectConnection ---
+        # --- Revert to DirectConnection for potentially lower latency ---
         self.run_timer.timeout.connect(self.run, Qt.ConnectionType.DirectConnection)
         self._is_transitioning_tracking = False # Add flag
         self.run_timer.setTimerType(Qt.TimerType.PreciseTimer) # Or AccurateTimer
         self._loop_start_time = 0 # To calculate processing time
 
+        # --- Recording Attributes ---
+        self.recording_enabled = False
+        self.recorder_process = None
+        self.recorder_queue = None
+        self.recorder_stop_event = None
     def _load_config(self):
         """Loads the configuration from the specified file path."""
         config = {}
@@ -134,6 +143,9 @@ class PipelineWorker(QObject):
                     config = json.load(f)
                 print(f"[Worker] Loaded config from: {self.config_path}") # Verbose for tracking
                 self.current_config = config
+                # --- Read Recording Setting ---
+                self.recording_enabled = config.get("enable_raw_data_recording", False)
+                print(f"[Worker] Raw data recording enabled: {self.recording_enabled}")
             else:
                 print(f"[Worker] Warning: Config file '{self.config_path}' not found. Using empty config.")
                 self.current_config = {}
@@ -356,6 +368,38 @@ class PipelineWorker(QObject):
         # Optionally emit finished signal here if appropriate
         # self.finished.emit()
 
+    # --- Recorder Process Management ---
+    def _start_recorder_process(self):
+        """Starts the DataRecorder in a separate process."""
+        if self.recorder_process and self.recorder_process.is_alive():
+            print("[Worker] Recorder process already running.")
+            print("[Worker Debug] Recorder already running, skipping start.") # DEBUG
+            return
+
+        try:
+            print("[Worker] Starting raw data recorder process...")
+            os.makedirs(RECORDINGS_DIR, exist_ok=True)
+            run_dir_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+            self.recorder_queue = mp_proc.Queue()
+            self.recorder_stop_event = mp_proc.Event()
+
+            # Create an instance of the recorder class
+            recorder_instance = DataRecorder(
+                data_queue=self.recorder_queue,
+                stop_event=self.recorder_stop_event,
+                run_dir_name=run_dir_name
+            )
+
+            # Start the process, targeting the recorder's run method
+            self.recorder_process = mp_proc.Process(target=recorder_instance.run, daemon=True)
+            self.recorder_process.start()
+            print("[Worker Debug] Recorder process initiated.") # DEBUG
+            print(f"[Worker] Recorder process started (PID: {self.recorder_process.pid}). Saving to {run_dir_name}")
+        except Exception as e:
+            print(f"[Worker] Failed to start recorder process: {e}")
+            print("[Worker Debug] Exception during recorder start.") # DEBUG
+            traceback.print_exc()
     # --- NEW SLOT TO HANDLE SAVE REQUESTS ---
     @pyqtSlot(str)
     def handle_save_profile(self, file_path):
@@ -403,10 +447,11 @@ class PipelineWorker(QObject):
     # @pyqtSlot() # No longer needs to be a slot if only called by timer
     def run(self):
         """Processes a single frame and schedules the next iteration."""
-        # --- Check if still running ---
+        # --- IMMEDIATE CHECK: Exit if stop has been requested ---
         if not self._running:
-            print("[Worker Run] Stop requested or not running.")
+            # Ensure timer is stopped if this is reached unexpectedly
             if self.run_timer.isActive():
+                print("[Worker Run Debug] Stopping timer from top check.")
                 self.run_timer.stop() # Stop timer if active
             self._cleanup_resources() # Perform cleanup
             self.finished.emit()
@@ -489,11 +534,11 @@ class PipelineWorker(QObject):
                 # --- Emit preview results ---
                 # --- Expanded Timing Calculation for Preview ---
                 t_cycle_end = time.perf_counter()
-                t_worker_cycle_ms = (t_cycle_end - t_cycle_start) * 1000
-                print(f"[Timing Preview (ms)] Grab: {t_frame_grab_ms:.1f}, "
-                      f"Pose/ROI: {t_preview_overhead_ms:.1f}, "
-                      f"Draw: {t_draw_overlays_ms:.1f}, "
-                      f"CycleTotal: {t_worker_cycle_ms:.1f}")
+                # t_worker_cycle_ms = (t_cycle_end - t_cycle_start) * 1000
+                # print(f"[Timing Preview (ms)] Grab: {t_frame_grab_ms:.1f}, "
+                #       f"Pose/ROI: {t_preview_overhead_ms:.1f}, "
+                #       f"Draw: {t_draw_overlays_ms:.1f}, "
+                #       f"CycleTotal: {t_worker_cycle_ms:.1f}")
 
                 self.new_frame_ready.emit(processed_frame)
                 self.new_plot_data.emit([]) # No plot data in preview
@@ -520,6 +565,24 @@ class PipelineWorker(QObject):
                 # The ROI is set during the state transition in set_tracking_active
 
                 results = self.pipeline_manager.process_frame(frame)
+
+                # --- Send Data to Recorder (if enabled) ---
+                if self.recording_enabled and self.recorder_queue is not None and results:
+                    try:
+                        # *** IMPORTANT: Ensure these keys exist in your 'results' dict ***
+                        raw_signal = results.get('raw_signal') # Get the *unfiltered* signal
+                        # --- UNCOMMENT TO DEBUG ---
+                        print(f"[Worker Debug] Results keys: {results.keys() if results else 'None'}")
+                        # --- END DEBUG PRINT ---
+                        tracked_points = results.get('tracked_points') # Get the coords used for signal
+
+                        if raw_signal is not None and tracked_points is not None:
+                            timestamp = time.time()
+                            # Put data onto the queue for the recorder process
+                            print(f"[Worker Debug] Putting data onto recorder queue: ts={timestamp:.2f}, signal={raw_signal:.4f}, points_shape={tracked_points.shape if hasattr(tracked_points, 'shape') else 'N/A'}") # DEBUG
+                            self.recorder_queue.put_nowait((timestamp, raw_signal, tracked_points))
+                    except mp_proc.queues.Full:
+                        print("[Worker] Warning: Recorder queue is full. Data point dropped.")
 
                 # --- Get tracked points from results ---
                 if results:
@@ -572,13 +635,13 @@ class PipelineWorker(QObject):
                     if 'timing_ms' in results:
                         pipeline_timings = results['timing_ms']
                         # Print expanded timings
-                        print(f"[Timing (ms)] Grab: {t_frame_grab_ms:.1f}, "
-                              f"FT: {pipeline_timings.get('feature_tracker', 0):.1f}, "
-                              f"SG: {pipeline_timings.get('signal_generator', 0):.1f}, "
-                              f"SP: {pipeline_timings.get('signal_processor', 0):.1f}, "
-                              f"Draw: {t_draw_overlays_ms:.1f}, "
-                              f"PipeTotal: {pipeline_timings.get('total_pipeline', 0):.1f}, "
-                              f"CycleTotal: {t_worker_cycle_ms:.1f}")
+                        # print(f"[Timing (ms)] Grab: {t_frame_grab_ms:.1f}, "
+                        #       f"FT: {pipeline_timings.get('feature_tracker', 0):.1f}, "
+                        #       f"SG: {pipeline_timings.get('signal_generator', 0):.1f}, "
+                        #       f"SP: {pipeline_timings.get('signal_processor', 0):.1f}, "
+                        #       f"Draw: {t_draw_overlays_ms:.1f}, "
+                        #       f"PipeTotal: {pipeline_timings.get('total_pipeline', 0):.1f}, "
+                        #       f"CycleTotal: {t_worker_cycle_ms:.1f}")
                     # --- END PRINT STATEMENT ---
 
                     # --- Emit latest filtered value for visualizer ---
@@ -624,9 +687,9 @@ class PipelineWorker(QObject):
     # --- ADDED: Centralized cleanup ---
     def _cleanup_resources(self):
         """Releases resources like video capture and pipeline components."""
-        print("[Worker] Cleaning up resources...")
-        if self.run_timer.isActive():
-             self.run_timer.stop() # Ensure timer is stopped
+        print("[Worker] Cleaning up resources...") # Removed "(excluding timer stop)" for clarity
+        # DO NOT stop self.run_timer here. It must be stopped from the worker thread itself (handled in run()).
+        # if self.run_timer.isActive(): self.run_timer.stop() # <<< REMOVED/COMMENTED
         if hasattr(self.video_input, 'release'):
             self.video_input.release()
             print("  Video input released.")
@@ -637,13 +700,43 @@ class PipelineWorker(QObject):
             self.pose_detector.close()
             print("  PoseDetector closed.")
         print("[Worker] Resource cleanup finished.")
+        # --- Stop Recorder Process ---
+        self._stop_recorder_process()
+
+    def _stop_recorder_process(self):
+        """Signals the recorder process to stop and waits for it."""
+        if self.recorder_process and self.recorder_process.is_alive():
+            print("[Worker Debug] Attempting to stop recorder process...") # DEBUG
+            print("[Worker] Stopping recorder process...")
+            if self.recorder_stop_event:
+                self.recorder_stop_event.set() # Signal the recorder loop to exit
+            if self.recorder_queue:
+                 self.recorder_queue.put("STOP") # Also send STOP command via queue
+            self.recorder_process.join(timeout=5.0) # Wait for graceful exit
+            if self.recorder_process.is_alive():
+                print("[Worker] Recorder process did not exit gracefully, terminating.")
+                self.recorder_process.terminate() # Force terminate if needed
+            print("[Worker Debug] Recorder process stop sequence complete.") # DEBUG
+            print("[Worker] Recorder process stopped.")
+        self.recorder_process = None
+        self.recorder_queue = None
+        self.recorder_stop_event = None
 
     def stop(self):
         """Requests the worker loop to stop."""
-        print("[Worker] Stop requested.")
-        self._running = False # Set the flag to false
-        # The timer will stop itself on the next check in run()
-        # No need to call _cleanup_resources here, run() handles it on exit
+        # This method is called via QueuedConnection from app.aboutToQuit,
+        # so it executes in the worker thread.
+        print("[Worker] stop() method executing in worker thread.")
+        self._running = False # Signal the run loop to stop processing on its next check
+        # Since we are in the worker thread, we can safely stop the timer directly here.
+        if self.run_timer.isActive():
+            print("[Worker Debug] Stopping timer directly within stop().")
+            self.run_timer.stop()
+
+        # Removed QApplication.processEvents(), _cleanup_resources(), and finished.emit()
+        # Rely on the run() method's check for self._running == False to trigger
+        # the final cleanup and finished signal emission.
+        print("[Worker Debug] stop() method finished setting flag and stopping timer.")
 
     def set_tracking_active(self, active: bool):
         """Slot to start or stop the tracking state."""
@@ -695,6 +788,10 @@ class PipelineWorker(QObject):
                         # If SP reset fails, revert state
                         self.state = WorkerState.PREVIEWING
                         self.locked_roi = []
+                    # --- MODIFIED: Add 3-second delay for recorder start ---
+                    if self.recording_enabled:
+                        print("[Worker] Scheduling recorder start in 3 seconds...")
+                        QTimer.singleShot(3000, self._delayed_start_recorder) # Delay start
                 else:
                     print("[Worker] Error: PipelineManager not available to set ROI/reset.")
                     self.processing_error.emit("PipelineManager error on tracking start.")
@@ -707,20 +804,35 @@ class PipelineWorker(QObject):
 
         elif not active and self.state == WorkerState.TRACKING:
             print("[Worker] Stopping tracking and returning to preview mode.")
+            # --- RE-ADD RECORDER STOP HERE ---
+            if self.recorder_process and self.recorder_process.is_alive():
+                self._stop_recorder_process() # Stop and save recording now
             self.state = WorkerState.PREVIEWING
             self.locked_roi = [] # Clear the locked ROI
         else:
             # Log if no state change occurs
             print(f"[Worker] set_tracking_active called in state {self.state} with active={active}. No change.")
 
+    # --- ADDED: Method to handle delayed recorder start ---
+    def _delayed_start_recorder(self):
+        """Starts the recorder process if still in TRACKING state."""
+        if self._running and self.state == WorkerState.TRACKING and self.recording_enabled:
+            print("[Worker Debug] Conditions met for delayed recorder start.") # DEBUG
+            print("[Worker] 3-second delay complete. Starting recorder now.")
+            self._start_recorder_process()
+
     def reload_profile(self, new_config_path):
         """Loads a new profile, stops processing, and re-initializes."""
         print(f"[Worker Slot] reload_profile called with path: {new_config_path}")
-        # --- MODIFIED: Stop the timer instead of just setting _running=False ---
-        if self.run_timer.isActive():
-            self.run_timer.stop()
-        self._running = False # Ensure state is consistent
-        self._cleanup_resources() # Clean up old resources before reloading
+        # --- Stop processing indirectly by setting _running flag ---
+        # Let the run() method handle stopping the timer safely in the worker thread.
+        self._running = False
+        # if self.run_timer.isActive(): self.run_timer.stop() # <<< REMOVED DIRECT STOP
+
+
+        # self._running = False # Already set above
+        # --- REMOVED: Do not call cleanup directly from here (wrong thread) ---
+        # self._cleanup_resources() # Clean up old resources before reloading
 
         # Reset internal state variables
         self.state = WorkerState.INITIALIZING
@@ -732,7 +844,11 @@ class PipelineWorker(QObject):
 
         # Load new config and re-run setup (setup will set _running=True and start init steps)
         self.config_path = new_config_path
-        self.setup() # This will load config and start component init if successful
+        # Setup will re-read config, check recording flag, and start recorder if needed
+        # It also handles starting the main processing loop timer
+        self.setup()
+
+
 
 
     # --- SLOT TO UPDATE OVERLAY STATES ---
@@ -823,6 +939,11 @@ class PipelineWorker(QObject):
 # --- Main Application Setup ---
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    # --- Required for multiprocessing on some platforms (e.g., Windows) ---
+    # Should be called early, especially if freezing the app later
+    # mp_proc.freeze_support() # Uncomment if needed, typically for frozen executables
+    # Set start method if needed (e.g., 'spawn' might be more stable on macOS/Windows)
+    # mp_proc.set_start_method('spawn', force=True) # Uncomment/adjust if experiencing issues
 
     # --- Determine Config Path ---
     config_file = os.path.join(PROFILES_DIR, DEFAULT_PROFILE)
