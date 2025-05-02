@@ -3,6 +3,7 @@
 # Sets up the PyQt6 application, creates the UI window, and manages the backend worker thread.
 # MODIFIED: Added settings application logic (apply_new_settings slot, signals).
 # FIXED: Added missing pyqtSlot import.
+# MODIFIED: Refactored worker run loop to use QTimer for responsiveness.
 
 import sys
 import os
@@ -89,7 +90,9 @@ class PipelineWorker(QObject):
     setup_finished = pyqtSignal(bool, str)
     component_initialized = pyqtSignal(str, bool, str)
     current_settings_signal = pyqtSignal(dict) # Emit initial/current settings to UI
+    profile_saved_signal = pyqtSignal(str, bool, str) # file_path, success, message
 
+    # --- ADDED: Timer for scheduling run loop ---
     def __init__(self, config_path, parent=None):
         super().__init__(parent)
         self.config_path = config_path
@@ -110,6 +113,13 @@ class PipelineWorker(QObject):
         self.show_pose = True # Default based on UI
         self.show_roi = True  # Default based on UI
         self.show_features = False # Default based on UI
+        # --- Timer ---
+        self.run_timer = QTimer(self) # Timer to drive the run loop
+        # --- MODIFIED: Explicitly set DirectConnection ---
+        self.run_timer.timeout.connect(self.run, Qt.ConnectionType.DirectConnection)
+        self._is_transitioning_tracking = False # Add flag
+        self.run_timer.setTimerType(Qt.TimerType.PreciseTimer) # Or AccurateTimer
+        self._loop_start_time = 0 # To calculate processing time
 
     def _load_config(self):
         """Loads the configuration from the specified file path."""
@@ -284,10 +294,12 @@ class PipelineWorker(QObject):
             self.current_settings_signal.emit(initial_settings)
             # --- End Emit Initial Settings ---
 
-            # Schedule the main run loop if still running
+            # --- MODIFIED: Start the run timer instead of calling run directly ---
             if self._running:
-                # Use QTimer.singleShot with 0ms delay to schedule run() on the event loop
-                QTimer.singleShot(0, self.run)
+                print(f"[Worker Run Start] Starting processing loop via timer in state: {self.state}")
+                self._loop_start_time = time.perf_counter() # Initialize loop timer
+                # Start the timer with a minimal delay (e.g., 1ms)
+                self.run_timer.start(1)
 
         except Exception as e:
             msg = f"Error initializing PipelineManager: {e}"
@@ -340,184 +352,256 @@ class PipelineWorker(QObject):
         # Optionally emit finished signal here if appropriate
         # self.finished.emit()
 
+    # --- NEW SLOT TO HANDLE SAVE REQUESTS ---
+    @pyqtSlot(str)
+    def handle_save_profile(self, file_path):
+        """Saves the current configuration to the specified file path."""
+        print(f"[Worker Slot] handle_save_profile called for path: {file_path}")
+        try:
+            # Ensure the directory exists
+            save_dir = os.path.dirname(file_path)
+            if not os.path.exists(save_dir):
+                os.makedirs(save_dir)
+                print(f"[Worker] Created directory: {save_dir}")
 
+            # Use the worker's current_config which should be up-to-date
+            settings_to_save = self.current_config
+
+            # Write the settings to the file
+            with open(file_path, 'w') as f:
+                json.dump(settings_to_save, f, indent=4)
+
+            print(f"[Worker] Profile saved successfully: {file_path}")
+            # Emit success signal *after* saving
+            self.profile_saved_signal.emit(file_path, True, f"Profile '{os.path.basename(file_path)}' saved.")
+
+        except Exception as e:
+            error_msg = f"Failed to save profile '{os.path.basename(file_path)}': {e}"
+            print(f"[Worker] {error_msg}")
+            traceback.print_exc()
+            # Emit failure signal
+            self.profile_saved_signal.emit(file_path, False, error_msg)
+        finally:
+             pass # Keep finally block structure if needed, or remove if empty
+
+    # --- ADDED: Wrapper slots for direct connection ---
+    @pyqtSlot()
+    def set_tracking_active_true(self):
+        """Slot to specifically call set_tracking_active(True)."""
+        self.set_tracking_active(True)
+
+    @pyqtSlot()
+    def set_tracking_active_false(self):
+        """Slot to specifically call set_tracking_active(False)."""
+        self.set_tracking_active(False)
+    # --- END WRAPPERS ---
+    # --- MODIFIED: run method processes ONE frame and reschedules ---
+    # @pyqtSlot() # No longer needs to be a slot if only called by timer
     def run(self):
-        """Main processing loop managing PREVIEWING and TRACKING states."""
+        """Processes a single frame and schedules the next iteration."""
+        # --- Check if still running ---
         if not self._running:
-            print("[Worker Run] Stop called before run loop started.")
+            print("[Worker Run] Stop requested or not running.")
+            if self.run_timer.isActive():
+                self.run_timer.stop() # Stop timer if active
+            self._cleanup_resources() # Perform cleanup
             self.finished.emit()
             return
-        # Check if components are initialized before starting the loop
+
+        # --- Check if components are initialized ---
         if not self._components_initialized:
-             print("[Worker Run] Components not initialized. Cannot start run loop.")
+             print("[Worker Run] Components not initialized. Stopping timer.")
+             if self.run_timer.isActive():
+                 self.run_timer.stop()
              self.processing_error.emit("Initialization failed. Cannot run.")
              self._running = False
+             self._cleanup_resources()
              self.finished.emit()
              return
-        # Ensure state is PREVIEWING after successful initialization
-        if self.state != WorkerState.PREVIEWING:
-            print(f"[Worker Run] Warning: Starting run loop in unexpected state {self.state}. Resetting to PREVIEWING.")
-            self.state = WorkerState.PREVIEWING
 
-        print(f"[Worker Run Start] Starting processing loop in state: {self.state}")
-        loop_count = 0
-        while self._running:
-            start_loop_time = time.perf_counter()
-            loop_count += 1
-            try:
-                success, frame = self.video_input.get_frame()
-                if not success or frame is None:
-                    print("[Worker] End of video source or cannot read frame.")
-                    self._running = False
-                    break
+        # --- Process one frame ---
+        try:
+            # Calculate time since last loop start for FPS control
+            frame_start_time = time.perf_counter()
+            time_since_last_loop = frame_start_time - self._loop_start_time
+            self._loop_start_time = frame_start_time # Reset for next iteration
 
-                processed_frame = frame.copy() # Frame for display with overlays
-                results = None
-                current_tracked_points = None # Store points from this frame's tracking result
+            success, frame = self.video_input.get_frame()
+            if not success or frame is None:
+                print("[Worker] End of video source or cannot read frame. Stopping.")
+                self._running = False
+                if self.run_timer.isActive():
+                    self.run_timer.stop()
+                self._cleanup_resources()
+                self.finished.emit()
+                return
 
-                # --- State-Dependent Processing & Drawing ---
-                if self.state == WorkerState.PREVIEWING:
-                    # Preview logic: Run pose detection and ROI calculation
-                    if not self.pose_detector or not self.coarse_roi_calculator:
-                        self.processing_error.emit("Preview components not ready.")
-                        time.sleep(0.1) # Avoid busy-looping
-                        continue
+            processed_frame = frame.copy()
+            results = None
+            current_tracked_points = None
 
-                    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    image_rgb.flags.writeable = False
-                    self.latest_landmarks = self.pose_detector.process_frame(image_rgb)
-                    image_rgb.flags.writeable = True
+            # --- State-Dependent Processing & Drawing ---
+            if self.state == WorkerState.PREVIEWING:
+                # Preview logic: Run pose detection and ROI calculation
+                if not self.pose_detector or not self.coarse_roi_calculator:
+                    self.processing_error.emit("Preview components not ready.")
+                    # Schedule next run slightly later to avoid busy loop
+                    if self._running: self.run_timer.start(50)
+                    return
 
-                    if self.latest_landmarks:
-                        frame_h, frame_w = frame.shape[:2]
-                        self.latest_preview_roi = self.coarse_roi_calculator.calculate_coarse_roi(self.latest_landmarks, (frame_h, frame_w))
-                    else:
-                        self.latest_preview_roi = []
+                image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image_rgb.flags.writeable = False
+                self.latest_landmarks = self.pose_detector.process_frame(image_rgb)
+                image_rgb.flags.writeable = True
 
-                    # Draw overlays for preview
-                    if self.show_pose and self.latest_landmarks:
-                        mp_drawing.draw_landmarks(processed_frame, self.latest_landmarks, mp_pose.POSE_CONNECTIONS, landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
-                    if self.show_roi and self.latest_preview_roi:
-                        for (x, y, w, h) in self.latest_preview_roi:
-                            cv2.rectangle(processed_frame, (x, y), (x + w, y + h), (0, 255, 255), 2) # Cyan ROI
+                if self.latest_landmarks:
+                    frame_h, frame_w = frame.shape[:2]
+                    self.latest_preview_roi = self.coarse_roi_calculator.calculate_coarse_roi(self.latest_landmarks, (frame_h, frame_w))
+                else:
+                    self.latest_preview_roi = []
 
-                    # Emit preview results
-                    self.new_frame_ready.emit(processed_frame)
-                    self.new_plot_data.emit([]) # No plot data in preview
-                    self.new_status.emit(0.0, False, SignalProcessor.PHASE_UNKNOWN) # No status in preview
+                # Draw overlays for preview
+                if self.show_pose and self.latest_landmarks:
+                    mp_drawing.draw_landmarks(processed_frame, self.latest_landmarks, mp_pose.POSE_CONNECTIONS, landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
+                if self.show_roi and self.latest_preview_roi:
+                    for (x, y, w, h) in self.latest_preview_roi:
+                        cv2.rectangle(processed_frame, (x, y), (x + w, y + h), (0, 255, 255), 2) # Cyan ROI
 
-                elif self.state == WorkerState.TRACKING:
-                    # Tracking logic: Run the full pipeline via PipelineManager
-                    if not self.locked_roi:
-                        print("[Worker] Error: Tracking active but no ROI locked.")
-                        self.processing_error.emit("Tracking started without ROI.")
-                        self.set_tracking_active(False) # Revert to preview
-                        continue
-                    if not self.pipeline_manager:
-                        print("[Worker] Error: PipelineManager not initialized for tracking.")
-                        self.processing_error.emit("PipelineManager Error.")
-                        self.set_tracking_active(False) # Revert to preview
-                        continue
+                # Emit preview results
+                self.new_frame_ready.emit(processed_frame)
+                self.new_plot_data.emit([]) # No plot data in preview
+                self.new_status.emit(0.0, False, SignalProcessor.PHASE_UNKNOWN) # No status in preview
 
-                    # Set the locked ROI in the manager (might be redundant if set at transition)
-                    # Ensure PipelineManager has a set_tracking_roi method
-                    if hasattr(self.pipeline_manager, 'set_tracking_roi'):
-                         self.pipeline_manager.set_tracking_roi(self.locked_roi)
-                    else:
-                         print("[Worker] Warning: PipelineManager does not have set_tracking_roi method.")
+            elif self.state == WorkerState.TRACKING:
+                # Tracking logic: Run the full pipeline via PipelineManager
+                if not self.locked_roi:
+                    print("[Worker] Error: Tracking active but no ROI locked.")
+                    self.processing_error.emit("Tracking error: ROI/Pipeline not ready.")
+                    self.set_tracking_active(False) # Revert to preview
+                    # Schedule next run
+                    if self._running: self.run_timer.start(1)
+                    return
+                if not self.pipeline_manager:
+                    print("[Worker] Error: PipelineManager not initialized for tracking.")
+                    self.processing_error.emit("Tracking error: ROI/Pipeline not ready.")
+                    self.set_tracking_active(False) # Revert to preview
+                    # Schedule next run
+                    if self._running: self.run_timer.start(1)
+                    return
 
+                # --- REMOVED: Redundant set_tracking_roi call ---
+                # The ROI is set during the state transition in set_tracking_active
 
-                    results = self.pipeline_manager.process_frame(frame)
+                results = self.pipeline_manager.process_frame(frame)
 
-                    # --- Get tracked points from results ---
-                    if results:
-                        current_tracked_points = results.get('tracked_points') # Adjust key if needed
+                # --- Get tracked points from results ---
+                if results:
+                    current_tracked_points = results.get('tracked_points') # Adjust key if needed
 
-                    # --- Draw Tracking Overlays ---
-                    # Draw locked ROI
-                    if self.show_roi and self.locked_roi:
-                        for (x, y, w, h) in self.locked_roi:
-                            cv2.rectangle(processed_frame, (x, y), (x + w, y + h), (0, 255, 0), 3) # Green Locked ROI
-                    # Optionally draw pose if available and enabled
-                    if self.show_pose and self.latest_landmarks:
-                        mp_drawing.draw_landmarks(processed_frame, self.latest_landmarks, mp_pose.POSE_CONNECTIONS, landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
+                # --- Draw Tracking Overlays ---
+                # Draw locked ROI
+                if self.show_roi and self.locked_roi:
+                    for (x, y, w, h) in self.locked_roi:
+                        cv2.rectangle(processed_frame, (x, y), (x + w, y + h), (0, 255, 0), 3) # Green Locked ROI
+                # Optionally draw pose if available and enabled
+                if self.show_pose and self.latest_landmarks:
+                    mp_drawing.draw_landmarks(processed_frame, self.latest_landmarks, mp_pose.POSE_CONNECTIONS, landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
 
-                    # --- Feature Drawing Logic ---
-                    if self.show_features:
-                        if current_tracked_points is not None and isinstance(current_tracked_points, np.ndarray):
-                            point_color = (0, 0, 255); points_drawn = 0
-                            try:
-                                # Ensure points are float32 and correct shape (N, 1, 2) or (N, 2)
-                                points_to_draw_float = current_tracked_points.astype(np.float32)
-                                if points_to_draw_float.ndim >= 2 and points_to_draw_float.shape[-1] == 2:
-                                    # Reshape to (N, 2) for easier iteration
-                                    points_to_draw = points_to_draw_float.reshape(-1, 2)
-                                    for i, point in enumerate(points_to_draw):
-                                        if point is not None and point.shape == (2,):
-                                            x_pt, y_pt = int(point[0]), int(point[1])
-                                            # Check bounds before drawing
-                                            frame_h_draw, frame_w_draw = processed_frame.shape[:2]
-                                            if 0 <= x_pt < frame_w_draw and 0 <= y_pt < frame_h_draw:
-                                                cv2.circle(processed_frame, (x_pt, y_pt), 3, point_color, -1)
-                                                points_drawn += 1
-                                else:
-                                     # Log if shape is unexpected after conversion
-                                     if loop_count % 60 == 0: # Log occasionally
-                                          print(f"[Worker Debug Frame {loop_count}] current_tracked_points has unexpected shape/ndim after float conversion: {points_to_draw_float.shape}")
-                            except Exception as draw_err:
-                                print(f"!!! ERROR during feature drawing loop: {draw_err}")
-                                traceback.print_exc() # Print full traceback for drawing errors
+                # --- Feature Drawing Logic ---
+                if self.show_features:
+                    if current_tracked_points is not None and isinstance(current_tracked_points, np.ndarray):
+                        point_color = (0, 0, 255); points_drawn = 0
+                        try:
+                            # Ensure points are float32 and correct shape (N, 1, 2) or (N, 2)
+                            points_to_draw_float = current_tracked_points.astype(np.float32)
+                            if points_to_draw_float.ndim >= 2 and points_to_draw_float.shape[-1] == 2:
+                                # Reshape to (N, 2) for easier iteration
+                                points_to_draw = points_to_draw_float.reshape(-1, 2)
+                                for i, point in enumerate(points_to_draw):
+                                    if point is not None and point.shape == (2,):
+                                        x_pt, y_pt = int(point[0]), int(point[1])
+                                        # Check bounds before drawing
+                                        frame_h_draw, frame_w_draw = processed_frame.shape[:2]
+                                        if 0 <= x_pt < frame_w_draw and 0 <= y_pt < frame_h_draw:
+                                            cv2.circle(processed_frame, (x_pt, y_pt), 3, point_color, -1)
+                                            points_drawn += 1
+                            else:
+                                 pass # Avoid excessive logging
+                        except Exception as draw_err:
+                            print(f"!!! ERROR during feature drawing loop: {draw_err}")
+                            traceback.print_exc() # Print full traceback for drawing errors
 
-                    # --- Emit Tracking Results ---
-                    self.new_frame_ready.emit(processed_frame)
-                    if results:
-                        plot_data = results.get('filtered_signal_history', [])
-                        bpm = results.get('bpm', 0.0)
-                        valid = results.get('bpm_valid', False)
-                        phase = results.get('phase', SignalProcessor.PHASE_UNKNOWN)
-                        self.new_plot_data.emit(plot_data)
-                        self.new_status.emit(bpm, valid, phase)
-                    else: # Handle case where pipeline_manager.process_frame returned None
-                        self.new_plot_data.emit([])
-                        self.new_status.emit(0.0, False, SignalProcessor.PHASE_UNKNOWN)
+                # --- Emit Tracking Results ---
+                self.new_frame_ready.emit(processed_frame)
+                if results:
+                    # Emit plot data and status
+                    plot_data = results.get('filtered_signal_history', [])
+                    bpm = results.get('bpm', 0.0)
+                    valid = results.get('bpm_valid', False)
+                    phase = results.get('phase', SignalProcessor.PHASE_UNKNOWN)
+                    self.new_plot_data.emit(plot_data)
+                    self.new_status.emit(bpm, valid, phase)
+                else: # Handle case where pipeline_manager.process_frame returned None
+                    self.new_plot_data.emit([])
+                    self.new_status.emit(0.0, False, SignalProcessor.PHASE_UNKNOWN)
 
-                # --- Loop Delay ---
-                loop_duration = time.perf_counter() - start_loop_time
-                target_interval = 1.0 / self.sampling_rate if self.sampling_rate > 0 else 0.033
-                sleep_time = max(0.001, target_interval - loop_duration)
-                time.sleep(sleep_time) # Prevent excessive CPU usage
+            # --- Calculate next schedule time ---
+            processing_duration = time.perf_counter() - frame_start_time
+            target_interval = 1.0 / self.sampling_rate if self.sampling_rate > 0 else 0.033
+            # Calculate delay needed to approximate target interval
+            delay_ms = max(1, int((target_interval - processing_duration) * 1000))
 
-            except Exception as e:
-                error_msg = f"Error in worker loop (State: {self.state}): {e}"
-                print(error_msg); traceback.print_exc()
-                self.processing_error.emit(error_msg)
-                time.sleep(0.1) # Pause briefly after an error
+            # --- Reschedule the next run ---
+            if self._running:
+                self.run_timer.start(delay_ms)
 
-        # --- Post-Loop Cleanup ---
-        print("[Worker] Stopping processing loop...")
+        except Exception as e:
+            error_msg = f"Error in worker processing cycle (State: {self.state}): {e}"
+            print(error_msg); traceback.print_exc()
+            self.processing_error.emit(error_msg)
+            # Reschedule even after error to avoid stopping completely
+            if self._running:
+                self.run_timer.start(100) # Schedule after a short delay on error
+
+    # --- ADDED: Centralized cleanup ---
+    def _cleanup_resources(self):
+        """Releases resources like video capture and pipeline components."""
+        print("[Worker] Cleaning up resources...")
+        if self.run_timer.isActive():
+             self.run_timer.stop() # Ensure timer is stopped
         if hasattr(self.video_input, 'release'):
             self.video_input.release()
+            print("  Video input released.")
         if self.pipeline_manager:
             self.pipeline_manager.close()
+            print("  PipelineManager closed.")
         if self.pose_detector:
             self.pose_detector.close()
-        print("[Worker] Resources released.")
-        self.finished.emit() # Signal that the worker has finished
-
+            print("  PoseDetector closed.")
+        print("[Worker] Resource cleanup finished.")
 
     def stop(self):
         """Requests the worker loop to stop."""
         print("[Worker] Stop requested.")
         self._running = False # Set the flag to false
+        # The timer will stop itself on the next check in run()
+        # No need to call _cleanup_resources here, run() handles it on exit
 
     def set_tracking_active(self, active: bool):
         """Slot to start or stop the tracking state."""
         print(f"[Worker Slot] set_tracking_active called with: {active}")
+
         # Prevent state changes if components aren't ready
         if not self._components_initialized and active:
             print("[Worker] Cannot start tracking: Components not yet initialized.")
             self.processing_error.emit("Components still initializing, please wait.")
             return
+
+        # --- Add re-entry guard for starting tracking ---
+        if active and self._is_transitioning_tracking:
+            print("[Worker] Warning: Ignoring set_tracking_active(True) call while already transitioning.")
+            return
+        # --- End guard ---
 
         if active and self.state == WorkerState.PREVIEWING:
             # Check if a valid ROI was found during preview
@@ -526,33 +610,42 @@ class PipelineWorker(QObject):
                 self.processing_error.emit("Cannot start tracking: Position yourself for ROI detection.")
                 return
 
-            print(f"[Worker] Locking ROI {self.latest_preview_roi} and starting tracking.")
-            self.locked_roi = copy.deepcopy(self.latest_preview_roi)
-            self.state = WorkerState.TRACKING
-            # Ensure the pipeline manager uses the locked ROI and reset signal processor
-            if self.pipeline_manager:
-                if hasattr(self.pipeline_manager, 'set_tracking_roi'):
-                    self.pipeline_manager.set_tracking_roi(self.locked_roi)
-                else:
-                     print("[Worker] Warning: PipelineManager lacks set_tracking_roi method.")
+            # --- Set transitioning flag ---
+            self._is_transitioning_tracking = True
+            try:
+                print(f"[Worker] Locking ROI {self.latest_preview_roi} and starting tracking.")
+                self.locked_roi = copy.deepcopy(self.latest_preview_roi)
+                self.state = WorkerState.TRACKING # State changes here
+                # Ensure the pipeline manager uses the locked ROI and reset signal processor
+                if self.pipeline_manager:
+                    if hasattr(self.pipeline_manager, 'set_tracking_roi'):
+                        self.pipeline_manager.set_tracking_roi(self.locked_roi)
+                    else:
+                         print("[Worker] Warning: PipelineManager lacks set_tracking_roi method.")
 
-                # Reset signal processor when tracking starts to clear old buffers
-                try:
-                    print("[Worker] Resetting SignalProcessor for new tracking session.")
-                    # Re-initialize SignalProcessor using the current config
-                    self.pipeline_manager.signal_processor = SignalProcessor(
-                        config=self.current_config.get('signal_processor', {}),
-                        sampling_rate=self.sampling_rate
-                    )
-                except Exception as e_sp_reset:
-                    print(f"[Worker] Error resetting SignalProcessor on tracking start: {e_sp_reset}")
-                    self.processing_error.emit("Error resetting signal processor.")
-            else:
-                print("[Worker] Error: PipelineManager not available to set ROI/reset.")
-                self.processing_error.emit("PipelineManager error on tracking start.")
-                # Revert state if manager is missing
-                self.state = WorkerState.PREVIEWING
-                self.locked_roi = []
+                    # Reset signal processor when tracking starts to clear old buffers
+                    try:
+                        print("[Worker] Resetting SignalProcessor for new tracking session.")
+                        # Re-initialize SignalProcessor using the current config
+                        self.pipeline_manager.signal_processor = SignalProcessor(
+                            config=self.current_config.get('signal_processor', {}),
+                            sampling_rate=self.sampling_rate
+                        )
+                    except Exception as e_sp_reset:
+                        print(f"[Worker] Error resetting SignalProcessor on tracking start: {e_sp_reset}")
+                        self.processing_error.emit("Error resetting signal processor.")
+                        # If SP reset fails, revert state
+                        self.state = WorkerState.PREVIEWING
+                        self.locked_roi = []
+                else:
+                    print("[Worker] Error: PipelineManager not available to set ROI/reset.")
+                    self.processing_error.emit("PipelineManager error on tracking start.")
+                    # Revert state if manager is missing
+                    self.state = WorkerState.PREVIEWING
+                    self.locked_roi = []
+            finally:
+                # --- Clear transitioning flag ---
+                self._is_transitioning_tracking = False
 
         elif not active and self.state == WorkerState.TRACKING:
             print("[Worker] Stopping tracking and returning to preview mode.")
@@ -565,11 +658,11 @@ class PipelineWorker(QObject):
     def reload_profile(self, new_config_path):
         """Loads a new profile, stops processing, and re-initializes."""
         print(f"[Worker Slot] reload_profile called with path: {new_config_path}")
-        # Stop current processing and reset state
-        self.stop() # Request the loop to stop
-        # Wait briefly for the loop to potentially finish its current iteration
-        # Note: A more robust approach might involve QThread.wait() or signals
-        time.sleep(0.2)
+        # --- MODIFIED: Stop the timer instead of just setting _running=False ---
+        if self.run_timer.isActive():
+            self.run_timer.stop()
+        self._running = False # Ensure state is consistent
+        self._cleanup_resources() # Clean up old resources before reloading
 
         # Reset internal state variables
         self.state = WorkerState.INITIALIZING
@@ -579,7 +672,7 @@ class PipelineWorker(QObject):
         self.latest_preview_roi = []
         self.latest_landmarks = None
 
-        # Load new config and re-run setup (setup will set _running=True if successful)
+        # Load new config and re-run setup (setup will set _running=True and start init steps)
         self.config_path = new_config_path
         self.setup() # This will load config and start component init if successful
 
@@ -589,14 +682,9 @@ class PipelineWorker(QObject):
     def update_overlay_settings(self, show_pose, show_roi, show_features):
         """Slot to update the overlay visibility flags."""
         current_thread_id = threading.get_ident() # Get current thread ID for debugging
-        print("*"*20)
-        print(f"[Worker Slot EXECUTION CONFIRMED - Thread: {current_thread_id}] Received: Pose={show_pose}, ROI={show_roi}, Features={show_features}")
-        # --- *** ---
         self.show_pose = show_pose
         self.show_roi = show_roi
         self.show_features = show_features
-        print(f"[Worker Slot Post-Set] self.show_features is now: {self.show_features}")
-        print("*"*20)
 
     # --- NEW SLOT TO APPLY SETTINGS ---
     @pyqtSlot(dict)
@@ -702,13 +790,18 @@ if __name__ == "__main__":
     worker.setup_finished.connect(main_window.handle_worker_setup_finished)
     worker.component_initialized.connect(main_window.handle_component_initialized)
     worker.current_settings_signal.connect(main_window.populate_settings_widgets) # New connection
+    worker.profile_saved_signal.connect(main_window.handle_profile_saved)
 
     # UI -> Worker
-    main_window.start_tracking_signal.connect(lambda: worker.set_tracking_active(True))
-    main_window.stop_tracking_signal.connect(lambda: worker.set_tracking_active(False))
-    main_window.load_profile_signal.connect(worker.reload_profile)
-    main_window.overlay_settings_changed.connect(worker.update_overlay_settings)
-    main_window.apply_settings_signal.connect(worker.apply_new_settings) # New connection
+    # --- MODIFIED: Connect directly to wrapper slots ---
+    main_window.start_tracking_signal.connect(worker.set_tracking_active_true)
+    main_window.stop_tracking_signal.connect(worker.set_tracking_active_false)
+    # --- END MODIFICATION ---
+    main_window.load_profile_signal.connect(worker.reload_profile, Qt.ConnectionType.QueuedConnection)
+    # --- MODIFIED: Explicitly queue save and apply settings ---
+    main_window.save_profile_signal.connect(worker.handle_save_profile, Qt.ConnectionType.QueuedConnection)
+    main_window.overlay_settings_changed.connect(worker.update_overlay_settings) # AutoConnection should be fine
+    main_window.apply_settings_signal.connect(worker.apply_new_settings, Qt.ConnectionType.QueuedConnection)
 
     # Connect Reset Signal (handle potential missing manager)
     def safe_reset_tracker():
@@ -717,18 +810,19 @@ if __name__ == "__main__":
         else:
              print("[Main] Error: Cannot reset tracker, PipelineManager not ready or lacks method.")
              main_window.show_error_message("Reset failed: Pipeline not ready.")
-    main_window.reset_tracking_signal.connect(safe_reset_tracker)
+    main_window.reset_tracking_signal.connect(safe_reset_tracker) # Direct connection likely okay
 
 
     # --- Thread Management ---
-    worker_thread.started.connect(worker.setup) # Start setup when thread starts
+    # --- MODIFIED: Explicitly queue the setup connection ---
+    worker_thread.started.connect(worker.setup, Qt.ConnectionType.QueuedConnection)
     worker.finished.connect(worker_thread.quit) # Quit thread when worker finishes
     worker.finished.connect(worker.deleteLater) # Schedule worker deletion
     worker_thread.finished.connect(worker_thread.deleteLater) # Schedule thread deletion
 
     # Graceful shutdown
-    app.aboutToQuit.connect(worker.stop) # Tell worker to stop on app quit
-    # Removed worker_thread.finished.connect(app.quit) to prevent potential race conditions on exit
+    # --- MODIFIED: Explicitly queue the stop connection ---
+    app.aboutToQuit.connect(worker.stop, Qt.ConnectionType.QueuedConnection)
 
     # --- Start Application ---
     main_window.show()

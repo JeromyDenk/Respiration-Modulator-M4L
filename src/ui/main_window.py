@@ -136,6 +136,8 @@ class MainWindow(QMainWindow):
         self.statusBar.showMessage("Initializing video source...")
         self._update_ui_state()
         # Ensure settings are hidden initially if toggle is unchecked
+        # Connect the (hypothetical) worker signal to the new slot
+        # self.worker.profile_saved_signal.connect(self.handle_profile_saved) # Placeholder
         self._toggle_settings_visibility(self.settings_toggle_button.isChecked())
 
 
@@ -222,9 +224,10 @@ class MainWindow(QMainWindow):
         self.pose_overlay_check.setChecked(True)
         self.roi_overlay_check.setChecked(True)
         self.features_overlay_check.setChecked(False)
-        self.pose_overlay_check.stateChanged.connect(self._emit_overlay_settings)
-        self.roi_overlay_check.stateChanged.connect(self._emit_overlay_settings)
-        self.features_overlay_check.stateChanged.connect(self._emit_overlay_settings)
+        # --- MODIFIED: Disconnect signals initially ---
+        # self.pose_overlay_check.stateChanged.connect(self._emit_overlay_settings)
+        # self.roi_overlay_check.stateChanged.connect(self._emit_overlay_settings)
+        # self.features_overlay_check.stateChanged.connect(self._emit_overlay_settings)
         overlays_layout.addWidget(self.pose_overlay_check)
         overlays_layout.addWidget(self.roi_overlay_check)
         overlays_layout.addWidget(self.features_overlay_check)
@@ -311,11 +314,12 @@ class MainWindow(QMainWindow):
 
         # --- Row 4: Settings Group Box (Initially Hidden) ---
         self.settings_main_group = QGroupBox()
-        # --- REMOVED: Remove borderless style to show child group box frames ---
-        # self.settings_main_group.setStyleSheet("QGroupBox { border: none; margin-top: 0px; padding-top: 0px; }")
+        # --- RE-ADDED: Make the main container borderless ---
+        self.settings_main_group.setStyleSheet("QGroupBox { border: none; margin-top: 0px; padding-top: 0px; }")
         settings_main_layout = QVBoxLayout(self.settings_main_group)
         # Add margins around the whole settings section
-        settings_main_layout.setContentsMargins(10, 10, 10, 10) # L, T, R, B (Added top margin back)
+        # --- MODIFIED: Remove top margin as container is borderless ---
+        settings_main_layout.setContentsMargins(10, 0, 10, 10) # L, T=0, R, B
         # Spacing between the row of groups and the apply button row
         settings_main_layout.setSpacing(15)
 
@@ -340,6 +344,15 @@ class MainWindow(QMainWindow):
         self.minDistance_spin = QSpinBox(minimum=1, maximum=50)
         self.winSize_spin = QSpinBox(minimum=3, maximum=51, singleStep=2) # Must be odd
         self.maxLevel_spin = QSpinBox(minimum=0, maximum=8)
+
+        # --- ADDED: Tooltips for Feature Tracking ---
+        self.maxCorners_spin.setToolTip("Maximum number of feature points to detect and track.")
+        self.qualityLevel_spin.setToolTip("Minimum acceptable quality of feature points (0.01-0.99). Higher values mean stricter filtering.")
+        self.minDistance_spin.setToolTip("Minimum Euclidean distance between detected feature points.")
+        self.winSize_spin.setToolTip("Size of the search window (pixels) for Lucas-Kanade optical flow.")
+        self.maxLevel_spin.setToolTip("Maximum level for the image pyramid used in Lucas-Kanade (0 means only original image).")
+        # --- END TOOLTIPS ---
+
         ft_layout.addRow("Max Corners:", self.maxCorners_spin)
         ft_layout.addRow("Quality Level:", self.qualityLevel_spin)
         ft_layout.addRow("Min Distance:", self.minDistance_spin)
@@ -591,15 +604,37 @@ class MainWindow(QMainWindow):
             self.save_profile_signal.emit(filePath)
             self.statusBar.showMessage(f"Save As requested to {os.path.basename(filePath)}.")
 
-            # Refresh profile list and select the newly saved profile
+            # --- REMOVE REFRESH LOGIC FROM HERE ---
+            # self._populate_profiles()
+            # new_profile_name = os.path.basename(filePath)
+            # index = self.profile_combo.findText(new_profile_name)
+            # if index != -1:
+            #     self.profile_combo.setCurrentIndex(index)
+            # else:
+            #     print(f"Warning: Could not automatically select new profile '{new_profile_name}' in dropdown.")
+            # --- END REMOVAL ---
+
+    # --- ADD NEW SLOT ---
+    def handle_profile_saved(self, file_path, success, message):
+        """Handles the confirmation signal from the backend after a save attempt."""
+        print(f"[UI] Received profile_saved confirmation: Path={file_path}, Success={success}, Msg={message}")
+        if success:
+            self.statusBar.showMessage(message, 3000)
+            # Refresh the profile list now that we know the file exists
             self._populate_profiles()
-            # Find and set the new profile in the combo box
-            new_profile_name = os.path.basename(filePath)
-            index = self.profile_combo.findText(new_profile_name)
+            # Find and select the profile in the combo box
+            profile_name = os.path.basename(file_path)
+            index = self.profile_combo.findText(profile_name)
             if index != -1:
                 self.profile_combo.setCurrentIndex(index)
+                print(f"[UI] Automatically selected '{profile_name}' in dropdown.")
             else:
-                print(f"Warning: Could not automatically select new profile '{new_profile_name}' in dropdown.")
+                # This warning is now more meaningful if it still occurs
+                print(f"Warning: Could not automatically select profile '{profile_name}' in dropdown after successful save confirmation.")
+        else:
+            # Show error message if saving failed
+            self.statusBar.showMessage(f"Save Failed: {message}", 5000)
+            QMessageBox.critical(self, "Save Failed", message)
 
 
     def _handle_track_button_toggle(self, checked):
@@ -853,7 +888,21 @@ class MainWindow(QMainWindow):
                      self.profile_combo.setEnabled(False); self.load_button.setEnabled(False); self.save_button.setEnabled(False); self.save_as_button.setEnabled(False)
                 if hasattr(self, 'settings_toggle_button'): self.settings_toggle_button.setEnabled(True)
                 self._update_ui_state()
-                self._emit_overlay_settings()
+
+                self._emit_overlay_settings() # Emit initial state once
+
+                # --- MODIFIED: Reconnect checkbox signals AFTER initial emit ---
+                try:
+                    self.pose_overlay_check.stateChanged.disconnect(self._emit_overlay_settings)
+                    self.roi_overlay_check.stateChanged.disconnect(self._emit_overlay_settings)
+                    self.features_overlay_check.stateChanged.disconnect(self._emit_overlay_settings)
+                except TypeError: # Signals might not have been connected yet (safety)
+                    pass
+                self.pose_overlay_check.stateChanged.connect(self._emit_overlay_settings)
+                self.roi_overlay_check.stateChanged.connect(self._emit_overlay_settings)
+                self.features_overlay_check.stateChanged.connect(self._emit_overlay_settings)
+                # --- END MODIFICATION ---
+
                 print("[UI] All components initialized. UI controls enabled.")
         else:
             fail_msg = f"{component_name} Initialization Failed: {message}"
@@ -911,11 +960,8 @@ if __name__ == '__main__':
             print(f"Could not create dummy profiles directory/file: {e}")
     main_win = MainWindow(profiles_dir=PROFILES_DIR_TEST)
     main_win.handle_worker_setup_finished(True, "Simulated video source OK")
-    main_win.handle_component_initialized("PoseDetector", True, "Simulated OK"); 
-    main_win.handle_component_initialized("FeatureTracker", True, "Simulated OK"); 
-    main_win.handle_component_initialized("SignalGenerator", True, "Simulated OK"); 
-    main_win.handle_component_initialized("SignalProcessor", True, "Simulated OK"); 
-    main_win.handle_component_initialized("OSCSender", True, "Simulated OK"); 
+    main_win.handle_component_initialized("PoseDetector", True, "Simulated OK");
+    main_win.handle_component_initialized("RoiCalculator", True, "Simulated OK"); # Added RoiCalculator init call
     main_win.handle_component_initialized("PipelineManager", True, "Simulated OK")
     dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8); dummy_frame[:,:,1] = 100 # Greenish frame
     main_win.update_webcam_feed(dummy_frame)
