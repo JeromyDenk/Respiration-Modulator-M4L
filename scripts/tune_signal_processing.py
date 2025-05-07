@@ -984,9 +984,17 @@ class TuningWindow(QMainWindow):
 
             # --- Use the configured SignalGenerator ---
             # Note: self.signal_generator was already initialized in _apply_settings()
-            recalculated_primary_signal = self.signal_generator.process_tracked_features(tracked_data_list)
+            recalculated_primary_signal_list = []
+            for old_p_frame, new_p_frame, _ in tracked_data_list: # qualities are None here
+                # Pass None for roi_definition as it's not critical for tuner's raw signal recalc
+                # and None for weights as they are not stored in the NPZ.
+                # The SignalGenerator's generate_signal method handles these None values.
+                signal_val, _ = self.signal_generator.generate_signal(
+                    old_p_frame, new_p_frame, None, None
+                )
+                recalculated_primary_signal_list.append(signal_val)
             # Apply inversion (as done in pipeline_manager)
-            self.raw_signal_processed = -np.array(recalculated_primary_signal)
+            self.raw_signal_processed = -np.array(recalculated_primary_signal_list)
             print(f"Raw signal recalculated using SignalGenerator ({self.signal_generator.aggregation_method}, IQR: {self.signal_generator.iqr_filter_enabled}).")
 
             # --- Handle Compare Mode ---
@@ -1004,9 +1012,16 @@ class TuningWindow(QMainWindow):
                 }
                 try:
                     alt_signal_generator = SignalGenerator(config=alt_sg_config)
-                    recalculated_alt_signal = alt_signal_generator.process_tracked_features(tracked_data_list)
+                    recalculated_alt_signal_list = []
+                    for old_p_frame, new_p_frame, _ in tracked_data_list:
+                        signal_val_alt, _ = alt_signal_generator.generate_signal(
+                            old_p_frame, new_p_frame, None, None
+                        )
+                        recalculated_alt_signal_list.append(signal_val_alt)
+
                     # Apply inversion
-                    self.raw_signal_alt_processed = -np.array(recalculated_alt_signal)
+                    self.raw_signal_alt_processed = -np.array(recalculated_alt_signal_list)
+
                     print(f"Alternative raw signal recalculated using SignalGenerator ({alt_method}, IQR: {alt_sg_config['IQR_FILTER_ENABLED']}).")
                 except Exception as e_alt:
                     print(f"Error creating/using alternative SignalGenerator: {e_alt}")
