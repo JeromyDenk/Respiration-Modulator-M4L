@@ -156,6 +156,20 @@ class PipelineWorker(QObject):
             raise # Re-raise to signal the failure upwards
         return self.current_config
 
+    def _load_config_from_path(self, file_path):
+        """Loads a configuration dictionary from a given file path."""
+        config = {}
+        try:
+            if file_path and os.path.exists(file_path):
+                with open(file_path, 'r') as f:
+                    config = json.load(f)
+                print(f"[Worker] Successfully loaded config from path: {file_path}")
+            else:
+                print(f"[Worker] Warning: Config file '{file_path}' not found for direct load. Returning empty config.")
+        except Exception as e:
+            print(f"[Worker] Error loading config from path '{file_path}': {e}")
+        return config
+
     def setup(self):
         """Initial setup: Load config and initialize video source."""
         print("[Worker] Running initial setup (Video & Config)...")
@@ -236,14 +250,11 @@ class PipelineWorker(QObject):
         if self._init_step == 0:
             self._initialize_pose_detector()
         elif self._init_step == 1:
-            self._initialize_roi_calculator()
-        elif self._init_step == 2:
             self._initialize_pipeline_manager()
-        # Add more steps here if needed
 
     def _initialize_pose_detector(self):
         """Initializes the PoseDetector component."""
-        if not self._running: return
+        # if not self._running: return False # Removed: Allow init even if main loop isn't "running"
         print("[Worker] Initializing PoseDetector..."); success = False; msg = ""
         try:
             pose_config = self.current_config.get("pose_detector", {});
@@ -252,10 +263,11 @@ class PipelineWorker(QObject):
             self.pose_detector = PoseDetector(config=pose_config)
             if not self.pose_detector.initialized:
                 raise RuntimeError("PoseDetector internal initialization failed.")
-            print("[Worker] PoseDetector Initialized."); success = True; msg = "PoseDetector OK."
-            self._init_step += 1
-            # Schedule the next step if still running
-            if self._running: QTimer.singleShot(10, self._run_next_init_step)
+            print("[Worker] PoseDetector Initialized.")
+            success = True; msg = "PoseDetector OK."
+            # Orchestration of next step is handled by _run_next_init_step or reload_profile
+            # self._init_step += 1 # Moved to _run_next_init_step
+            # if self._running: QTimer.singleShot(10, self._run_next_init_step) # Moved
         except Exception as e:
             msg = f"Error initializing PoseDetector: {e}"
             print(f"[Worker] {msg}"); traceback.print_exc()
@@ -264,20 +276,22 @@ class PipelineWorker(QObject):
             # Emit signal regardless of success
             self.component_initialized.emit("PoseDetector", success, msg);
             # If failed, stop the initialization sequence
-            if not success: self._initialization_failed()
+            if not success: self._initialization_failed() # This will stop further init steps
+        return success # Return success status
 
     def _initialize_roi_calculator(self):
         """Initializes the CoarseRoiCalculator component."""
-        if not self._running: return
+        # if not self._running: return False # Removed: Allow init even if main loop isn't "running"
         print("[Worker] Initializing CoarseRoiCalculator..."); success = False; msg = ""
         try:
             coarse_roi_config = self.current_config.get("coarse_roi_calculator", {})
             # No close method needed for RoiCalculator currently
             self.coarse_roi_calculator = CoarseRoiCalculator(config=coarse_roi_config)
-            print("[Worker] CoarseRoiCalculator Initialized."); success = True; msg = "RoiCalculator OK."
-            self._init_step += 1
-            # Schedule the next step if still running
-            if self._running: QTimer.singleShot(10, self._run_next_init_step)
+            print("[Worker] CoarseRoiCalculator Initialized.")
+            success = True; msg = "RoiCalculator OK."
+            # Orchestration of next step is handled by _run_next_init_step or reload_profile
+            # self._init_step += 1 # Moved
+            # if self._running: QTimer.singleShot(10, self._run_next_init_step) # Moved
         except Exception as e:
             msg = f"Error initializing CoarseRoiCalculator: {e}"
             print(f"[Worker] {msg}"); traceback.print_exc()
@@ -286,36 +300,22 @@ class PipelineWorker(QObject):
             # Emit signal regardless of success
             self.component_initialized.emit("RoiCalculator", success, msg);
             # If failed, stop the initialization sequence
-            if not success: self._initialization_failed()
+            if not success: self._initialization_failed() # This will stop further init steps
+        return success # Return success status
 
     def _initialize_pipeline_manager(self):
         """Initializes the PipelineManager and emits initial settings."""
-        if not self._running: return
+        # if not self._running: return False # Removed: Allow init even if main loop isn't "running"
         print("[Worker] Initializing PipelineManager..."); success = False; msg = ""
         try:
             # Close existing manager if any
             if self.pipeline_manager: self.pipeline_manager.close()
             # Initialize with current config and sampling rate
             self.pipeline_manager = PipelineManager(config=self.current_config, sampling_rate=self.sampling_rate)
-            print("[Worker] PipelineManager Initialized."); success = True; msg = "PipelineManager OK."
-            self._init_step += 1
-            self._components_initialized = True
-            self.state = WorkerState.PREVIEWING # Ready for preview
-            print("[Worker] All components initialized successfully.")
-
-            # --- Emit Initial Settings ---
-            # Extract relevant settings from current_config to send to UI
-            initial_settings = self._extract_relevant_settings(self.current_config)
-            print(f"[Worker] Emitting initial settings: {initial_settings}")
-            self.current_settings_signal.emit(initial_settings)
-            # --- End Emit Initial Settings ---
-
-            # --- MODIFIED: Start the run timer instead of calling run directly ---
-            if self._running:
-                print(f"[Worker Run Start] Starting processing loop via timer in state: {self.state}")
-                self._loop_start_time = time.perf_counter() # Initialize loop timer
-                # Start the timer with a minimal delay (e.g., 1ms)
-                self.run_timer.start(1)
+            print("[Worker] PipelineManager Initialized.")
+            success = True; msg = "PipelineManager OK."
+            # Final setup steps (state, timer start, settings emit) are handled by the orchestrator
+            # (_run_next_init_step or reload_profile)
 
         except Exception as e:
             msg = f"Error initializing PipelineManager: {e}"
@@ -326,8 +326,40 @@ class PipelineWorker(QObject):
             # Emit signal regardless of success
             self.component_initialized.emit("PipelineManager", success, msg)
             # If failed, stop the initialization sequence
-            if not success:
-                self._initialization_failed()
+            if not success: self._initialization_failed() # This will stop further init steps
+        return success # Return success status
+
+    def _run_next_init_step(self):
+        """Sequentially initializes pipeline components during initial setup."""
+        if not self._running:
+            print("[Worker] Stop called during initial setup sequence.")
+            return
+
+        success = False
+        if self._init_step == 0:
+            if self._initialize_pose_detector(): # Call the refactored method
+                self._init_step += 1
+                if self._running: QTimer.singleShot(10, self._run_next_init_step)
+        elif self._init_step == 1:
+            if self._initialize_roi_calculator(): # Call the refactored method
+                self._init_step += 1
+                if self._running: QTimer.singleShot(10, self._run_next_init_step)
+        elif self._init_step == 2:
+            if self._initialize_pipeline_manager(): # Call the refactored method
+                # This is the last step of initial setup
+                self._components_initialized = True
+                self.state = WorkerState.PREVIEWING
+                print("[Worker] All components initialized successfully (initial setup).")
+                initial_settings = self._extract_relevant_settings(self.current_config)
+                self.current_settings_signal.emit(initial_settings)
+                if self._running:
+                    print(f"[Worker Run Start] Starting processing loop via timer in state: {self.state}")
+                    self._loop_start_time = time.perf_counter()
+                    self.run_timer.start(1)
+            # No further steps after PipelineManager in initial setup
+        # If any step failed, _initialization_failed() would have been called by the
+        # respective _initialize_X method, and _running would be false, stopping this chain.
+
 
     def _extract_relevant_settings(self, config_dict):
         """Extracts settings relevant for UI population from the full config."""
@@ -847,32 +879,80 @@ class PipelineWorker(QObject):
     def reload_profile(self, new_config_path):
         """Loads a new profile, stops processing, and re-initializes."""
         print(f"[Worker Slot] reload_profile called with path: {new_config_path}")
-        # --- Stop processing indirectly by setting _running flag ---
-        # Let the run() method handle stopping the timer safely in the worker thread.
+
+        # 1. Stop current processing
         self._running = False
-        # if self.run_timer.isActive(): self.run_timer.stop() # <<< REMOVED DIRECT STOP
+        if self.run_timer.isActive():
+            self.run_timer.stop()
+        print("[Worker] Processing loop stopped for profile reload.")
 
+        # 2. Load new configuration and compare video settings
+        old_video_config = copy.deepcopy(self.current_config.get("video_input", {}))
+        new_config = self._load_config_from_path(new_config_path)
+        if not new_config: # If loading failed
+            self.processing_error.emit(f"Failed to load profile: {new_config_path}")
+            # Attempt to restart with old config if possible, or signal critical error
+            if self._components_initialized and self.video_input: # Check if we can restart
+                self._running = True
+                self.run_timer.start(1)
+            return
 
-        # self._running = False # Already set above
-        # --- REMOVED: Do not call cleanup directly from here (wrong thread) ---
-        # self._cleanup_resources() # Clean up old resources before reloading
+        new_video_config = new_config.get("video_input", {})
+        video_settings_changed = (old_video_config != new_video_config)
 
-        # Reset internal state variables
-        self.state = WorkerState.INITIALIZING
-        self._components_initialized = False
-        self._init_step = 0
-        self.locked_roi = []
-        self.latest_preview_roi = []
-        self.latest_landmarks = None
+        # 3. Update internal config path and current_config
+        self.config_path = new_config_path # Store the new path
+        self.current_config = new_config   # Adopt the new config
+        self.recording_enabled = self.current_config.get("enable_raw_data_recording", False) # Update recording flag
 
-        # Load new config and re-run setup (setup will set _running=True and start init steps)
-        self.config_path = new_config_path
-        # Setup will re-read config, check recording flag, and start recorder if needed
-        # It also handles starting the main processing loop timer
-        self.setup()
+        if video_settings_changed:
+            print("[Worker] Video settings changed. Full re-initialization required.")
+            self._cleanup_resources() # Releases everything, including old VideoInput
+            # Reset state for full setup
+            self.state = WorkerState.INITIALIZING
+            self._components_initialized = False
+            self._init_step = 0
+            self.locked_roi = []
+            self.latest_preview_roi = []
+            self.latest_landmarks = None
+            self.setup() # This will re-init VideoInput and then other components
+        else:
+            print("[Worker] Video settings unchanged. Reconfiguring processing components.")
+            # VideoInput is preserved. Re-initialize other components.
+            # Stop recorder if it was running, as other params might affect data
+            self._stop_recorder_process()
 
+            try:
+                # Re-initialize PoseDetector
+                if not self._initialize_pose_detector(): # Call refactored
+                    raise RuntimeError("PoseDetector re-init failed.")
 
+                # Re-initialize CoarseRoiCalculator
+                if not self._initialize_roi_calculator(): # Call refactored
+                    raise RuntimeError("CoarseRoiCalculator re-init failed.")
 
+                # Re-initialize PipelineManager
+                if not self._initialize_pipeline_manager(): # Call refactored
+                    raise RuntimeError("PipelineManager re-init failed.")
+
+                # If all re-initializations are successful
+                self.state = WorkerState.PREVIEWING # Default to preview after profile change
+                self.locked_roi = []
+                self._components_initialized = True # Mark as ready
+                self._running = True
+                self._loop_start_time = time.perf_counter()
+                # Emit the (potentially new) settings to the UI after successful re-init
+                current_ui_settings = self._extract_relevant_settings(self.current_config)
+                self.current_settings_signal.emit(current_ui_settings)
+                self.run_timer.start(1)
+                print("[Worker] Processing components reconfigured. Resuming in preview mode.")
+
+            except Exception as e:
+                error_msg = f"Error reconfiguring components after profile reload: {e}"
+                print(f"[Worker] {error_msg}")
+                traceback.print_exc()
+                self.processing_error.emit(error_msg)
+                self._initialization_failed() # Go to a safe, non-running state
 
     # --- SLOT TO UPDATE OVERLAY STATES ---
     @pyqtSlot(bool, bool, bool) # Decorate slot for type safety

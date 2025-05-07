@@ -1,7 +1,7 @@
 {
   "profile_name": "Test Profile with Tuned LK Params and 1080p",
   "description": "Configuration using LK parameters found via slider tuning, requesting 1080p resolution. EVM enabled.",
-  "enable_raw_data_recording": true,
+  "enable_raw_data_recording": false,
   "video_input": {
     "VIDEO_SOURCE": 0,
     "VIDEO_WIDTH": 1920,
@@ -24,7 +24,7 @@
   },
   "coarse_roi_calculator": {
     "ROI_STRATEGY": "single_chest_abdomen",
-    "ROI_HORIZONTAL_SCALE_FACTOR": 1.05,
+    "ROI_HORIZONTAL_SCALE_FACTOR": 0.95,
     "ROI_TOP_PADDING_RATIO": 0.025,
     "ROI_BOTTOM_PADDING_RATIO": 0.025,
     "POSE_MIN_LANDMARK_VISIBILITY": 0.6,

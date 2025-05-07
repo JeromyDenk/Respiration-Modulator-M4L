@@ -46,3 +46,4 @@ Implement PCA-based signal generation as a toggleable alternative to median vert
 
 Feature Quality Weighting (Shi-Tomasi Score)
 
+Add TQDM to webcam feed when loading
