@@ -65,7 +65,7 @@ except Exception as e_general:
 
 
 # --- Constants ---
-DEFAULT_PROFILE = "test_profile.json"
+DEFAULT_PROFILE = "test_profile 2.json"
 PROFILES_DIR = os.path.join(script_dir, "profiles")
 RECORDINGS_DIR = os.path.join(script_dir, "recordings") # Base dir for recordings
 

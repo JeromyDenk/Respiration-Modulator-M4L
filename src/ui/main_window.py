@@ -123,11 +123,12 @@ class MainWindow(QMainWindow):
     def __init__(self, config_file="", profiles_dir="", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Respiration Modulator M4L")
-        self.setGeometry(100, 100, 1200, 700) # Initial size
+        self.setGeometry(100, 100, 1200, 1050) # Initial size (height increased by 50%)
 
         self.config_file = config_file # Store initial config path
         self.profiles_dir = profiles_dir # Store profiles directory path
         self.plot_data_buffer = np.zeros(PLOT_BUFFER_SIZE)
+        self._pose_overlay_state_before_tracking = True # Default to True
         self.tracking_active = False # UI's understanding of tracking state
 
         self._init_ui()
@@ -335,9 +336,13 @@ class MainWindow(QMainWindow):
         # Use QFormLayout inside
         ft_layout = QFormLayout(ft_group)
         # --- MODIFIED: Adjust margins for default group box style ---
-        ft_layout.setContentsMargins(10, 10, 10, 10) # L, T, R, B (Reduced top margin)
+        ft_layout.setContentsMargins(10, 20, 10, 10) # L, T, R, B (Increased top margin for title)
         # Add vertical spacing between rows within this form
-        ft_layout.setVerticalSpacing(10)
+        # --- Explicitly add a border to ft_group ---
+        ft_group.setStyleSheet("QGroupBox { border: 1px solid gray; margin-top: 0.5em; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px 0 3px; }")
+        ft_layout.setVerticalSpacing(12) # Increased vertical spacing
+
+        ft_group.setFont(larger_font) # Apply larger font to the group box itself (for title)
 
         self.maxCorners_spin = QSpinBox(minimum=10, maximum=500)
         self.qualityLevel_spin = QDoubleSpinBox(minimum=0.01, maximum=0.99, singleStep=0.01, decimals=2)
@@ -358,6 +363,13 @@ class MainWindow(QMainWindow):
         ft_layout.addRow("Min Distance:", self.minDistance_spin)
         ft_layout.addRow("Window Size:", self.winSize_spin)
         ft_layout.addRow("Pyramid Levels:", self.maxLevel_spin)
+
+        # Apply larger font and fixed height to FT input widgets
+        for widget in [self.maxCorners_spin, self.qualityLevel_spin, self.minDistance_spin,
+                       self.winSize_spin, self.maxLevel_spin]:
+            widget.setFont(larger_font)
+            widget.setFixedHeight(28) # Optional: Adjust height
+
         settings_row_layout.addWidget(ft_group) # Add group to the horizontal layout
 
 
@@ -368,9 +380,13 @@ class MainWindow(QMainWindow):
         # Use QFormLayout inside
         sp_layout = QFormLayout(sp_group)
         # --- MODIFIED: Adjust margins for default group box style ---
-        sp_layout.setContentsMargins(10, 10, 10, 10) # L, T, R, B (Reduced top margin)
+        sp_layout.setContentsMargins(10, 20, 10, 10) # L, T, R, B (Increased top margin for title)
         # Add vertical spacing between rows within this form
-        sp_layout.setVerticalSpacing(10)
+        # --- Explicitly add a border to sp_group ---
+        sp_group.setStyleSheet("QGroupBox { border: 1px solid gray; margin-top: 0.5em; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px 0 3px; }")
+        sp_layout.setVerticalSpacing(12) # Increased vertical spacing
+
+        sp_group.setFont(larger_font) # Apply larger font to the group box itself (for title)
 
         self.aggMethod_combo = QComboBox()
         self.aggMethod_combo.addItems(["median", "mean"])
@@ -405,6 +421,13 @@ class MainWindow(QMainWindow):
 
         sp_layout.addRow("Filter Method:", self.filtType_combo)
         sp_layout.addRow("Peak Prominence:", self.peakProm_spin)
+
+        # Apply larger font and fixed height to SP input widgets
+        for widget in [self.aggMethod_combo, self.filtLow_spin, self.filtHigh_spin,
+                       self.filtType_combo, self.peakProm_spin]:
+            widget.setFont(larger_font)
+            widget.setFixedHeight(28) # Optional: Adjust height
+
         settings_row_layout.addWidget(sp_group) # Add group to the horizontal layout
 
         # Add the row containing both group boxes to the main settings layout
@@ -432,11 +455,11 @@ class MainWindow(QMainWindow):
 
         # --- Apply Larger Font to Group Box Titles explicitly ---
         title_font = QFont(larger_font)
-        # title_font.setBold(True) # Optional: Make titles bold
+        title_font.setBold(True) # Optional: Make titles bold for group boxes
         status_group.setFont(title_font)
         overlays_group.setFont(title_font)
-        ft_group.setFont(title_font)
-        sp_group.setFont(title_font)
+        # ft_group.setFont(title_font) # Already set above
+        # sp_group.setFont(title_font) # Already set above
         profile_group.setFont(title_font)
 
         # --- Call toggle settings AFTER all widgets are created ---
@@ -642,12 +665,28 @@ class MainWindow(QMainWindow):
         if checked:
             self.tracking_active = True
             self.track_button.setText("Stop Tracking")
+            # Store current pose overlay state before disabling it
+            self._pose_overlay_state_before_tracking = self.pose_overlay_check.isChecked()
+            # --- UI Changes on Tracking START ---
+            self.pose_overlay_check.setChecked(False)
+            self.pose_overlay_check.setEnabled(False) # Explicitly disable
+            self.features_overlay_check.setChecked(True)
+            # Emit overlay changes immediately so worker is aware
+            self._emit_overlay_settings()
+            # --- End UI Changes ---
             print("[UI] Start Tracking signal emitted.")
             self.start_tracking_signal.emit()
             self.statusBar.showMessage("Tracking started...")
         else:
             self.tracking_active = False
             self.track_button.setText("Start Tracking")
+            # --- UI Changes on Tracking STOP ---
+            self.pose_overlay_check.setEnabled(True) # Explicitly enable
+            # Restore the pose overlay state from before tracking
+            self.pose_overlay_check.setChecked(self._pose_overlay_state_before_tracking)
+            # "Show Features" remains as is (likely checked from when tracking started)
+            self._emit_overlay_settings() # Emit settings after restoring/enabling pose checkbox
+            # --- End UI Changes ---
             print("[UI] Stop Tracking signal emitted.")
             self.stop_tracking_signal.emit()
             # Reset plot and status when stopped
@@ -745,7 +784,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'apply_button'): self.apply_button.setEnabled(settings_enabled)
         if hasattr(self, 'settings_toggle_button'): self.settings_toggle_button.setEnabled(components_ready)
 
-        self.pose_overlay_check.setEnabled(components_ready)
+        # Show Pose is enabled when components are ready AND not actively tracking (i.e., previewing)
+        self.pose_overlay_check.setEnabled(is_previewing and components_ready)
         self.roi_overlay_check.setEnabled(components_ready)
         self.features_overlay_check.setEnabled(self.tracking_active and components_ready)
 
