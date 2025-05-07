@@ -628,19 +628,36 @@ class TuningWindow(QMainWindow):
         self.filtLow_spin.setFont(self.larger_font) # Apply font
         self.filtHigh_spin.setFont(self.larger_font) # Apply font
         self.filtType_combo = QComboBox()
-        self.filtType_combo.addItems(["lfilter", "filtfilt"])
+        self.filtType_combo.addItems(["lfilter", "filtfilt", "ema"]) # Added "ema"
         self.filtType_combo.setFont(self.larger_font) # Apply font
+        self.filtType_combo.currentIndexChanged.connect(self._update_filter_param_widgets_state) # Connect signal
+
+        self.emaAlpha_spin = QDoubleSpinBox(minimum=0.01, maximum=1.0, singleStep=0.01, value=0.1, decimals=3)
+        self.emaAlpha_spin.setFont(self.larger_font)
+
         self.peakProm_spin = QDoubleSpinBox(minimum=0.0, maximum=10.0, singleStep=0.005, value=0.0, decimals=3)
         self.peakProm_spin.setFont(self.larger_font) # Apply font
+
+        # --- Add filtfilt padding controls ---
+        self.padType_combo = QComboBox()
+        self.padType_combo.addItems(["odd", "even", "constant", "gust"]) # 'gust' for Gustafsson's method (filtfilt default if padlen=0)
+        self.padType_combo.setCurrentText("gust") # Default to filtfilt's internal default behavior
+        self.padType_combo.setFont(self.larger_font)
+        self.padLen_spin = QSpinBox(minimum=0, maximum=200, value=0) # 0 means filtfilt uses its default padlen
+        self.padLen_spin.setFont(self.larger_font)
 
         self.filtLow_spin.setToolTip("Lower cutoff frequency (Hz) for bandpass filter.")
         self.filtHigh_spin.setToolTip("Upper cutoff frequency (Hz) for bandpass filter.")
         self.filtType_combo.setToolTip("Filter method: lfilter (causal) or filtfilt (zero-phase).")
+        self.emaAlpha_spin.setToolTip("Smoothing factor for EMA filter (0.01-1.0). Smaller is more smoothing.")
         self.peakProm_spin.setToolTip("Minimum peak prominence for peak detection (0 = disabled).")
 
         sp_layout.addRow("Filter Low (Hz):", self.filtLow_spin)
         sp_layout.addRow("Filter High (Hz):", self.filtHigh_spin)
         sp_layout.addRow("Filter Method:", self.filtType_combo)
+        sp_layout.addRow("EMA Alpha:", self.emaAlpha_spin) # Add EMA Alpha spinbox
+        sp_layout.addRow("Filtfilt Pad Type:", self.padType_combo)
+        sp_layout.addRow("Filtfilt Pad Len:", self.padLen_spin)
         sp_peak_label = QLabel("Peak Prominence:") # Create label explicitly
         sp_peak_label.setFont(self.larger_font) # Apply font
         sp_layout.addRow(sp_peak_label, self.peakProm_spin)
@@ -651,7 +668,12 @@ class TuningWindow(QMainWindow):
         # Explicit creation is safer if layout changes
         sp_layout.labelForField(self.filtLow_spin).setFont(self.larger_font)
         sp_layout.labelForField(self.filtHigh_spin).setFont(self.larger_font)
+        sp_layout.labelForField(self.emaAlpha_spin).setFont(self.larger_font)
+        sp_layout.labelForField(self.padType_combo).setFont(self.larger_font)
+        sp_layout.labelForField(self.padLen_spin).setFont(self.larger_font)
         sp_layout.labelForField(self.filtType_combo).setFont(self.larger_font)
+
+        self._update_filter_param_widgets_state() # Initial state update
 
                 # --- Spectrum Analyzer Settings ---
         sa_group = QGroupBox("Spectrum Analyzer")
@@ -771,8 +793,13 @@ class TuningWindow(QMainWindow):
             'SIGNAL_FILTER_LOW_HZ': self.filtLow_spin.value(),
             'SIGNAL_FILTER_HIGH_HZ': self.filtHigh_spin.value(),
             'SIGNAL_FILTER_METHOD': self.filtType_combo.currentText(),
-            'PEAK_DETECT_PROMINENCE': self.peakProm_spin.value() if self.peakProm_spin.value() > 1e-6 else None
+            'EMA_ALPHA': self.emaAlpha_spin.value(), # Add EMA_ALPHA
+            'PEAK_DETECT_PROMINENCE': self.peakProm_spin.value() if self.peakProm_spin.value() > 1e-6 else None, # Keep this
+            'PAD_TYPE': self.padType_combo.currentText(), # Add pad_type
+            'PAD_LEN': self.padLen_spin.value()          # Add pad_len
         }
+        # --- ADD DEBUG PRINT ---
+        print(f"[Tuner Debug] SignalProcessor config being applied: {sp_config}")
 
         try:
             self.signal_generator = SignalGenerator(config=sg_config)
@@ -799,7 +826,10 @@ class TuningWindow(QMainWindow):
                 'SIGNAL_FILTER_LOW_HZ': self.filtLow_spin.value(),
                 'SIGNAL_FILTER_HIGH_HZ': self.filtHigh_spin.value(),
                 'SIGNAL_FILTER_METHOD': self.filtType_combo.currentText(),
-                'PEAK_DETECT_PROMINENCE': self.peakProm_spin.value() if self.peakProm_spin.value() > 1e-6 else None
+                'EMA_ALPHA': self.emaAlpha_spin.value(),
+                'PEAK_DETECT_PROMINENCE': self.peakProm_spin.value() if self.peakProm_spin.value() > 1e-6 else None, # Keep this
+                'PAD_TYPE': self.padType_combo.currentText(),
+                'PAD_LEN': self.padLen_spin.value()
             }
         }
         return settings
@@ -828,6 +858,13 @@ class TuningWindow(QMainWindow):
             self.filtType_combo.setCurrentText(filt_method)
             prominence = sp_settings.get('PEAK_DETECT_PROMINENCE')
             self.peakProm_spin.setValue(prominence if prominence is not None else 0.0)
+            # --- Populate EMA Alpha ---
+            self.emaAlpha_spin.setValue(sp_settings.get('EMA_ALPHA', 0.1))
+            # --- Populate filtfilt padding controls ---
+            self.padType_combo.setCurrentText(sp_settings.get('PAD_TYPE', 'gust')) # Default to 'gust'
+            self.padLen_spin.setValue(sp_settings.get('PAD_LEN', 0)) # Default to 0
+
+            self._update_filter_param_widgets_state() # Update enabled states based on loaded method
 
             print("[UI] Settings widgets populated.")
 
@@ -1393,6 +1430,28 @@ class TuningWindow(QMainWindow):
         """Pauses playback when the user starts dragging the slider."""
         if self.is_playing:
             self.play_pause_button.setChecked(False) # This triggers _toggle_playback to pause
+
+    def _update_filter_param_widgets_state(self):
+        """Enables/disables filter parameter widgets based on the selected filter method."""
+        selected_method = self.filtType_combo.currentText()
+
+        is_butter_filtfilt = selected_method in ['lfilter', 'filtfilt']
+        is_filtfilt_only = selected_method == 'filtfilt'
+        is_ema = selected_method == 'ema'
+
+        # Butterworth/filtfilt specific params
+        self.filtLow_spin.setEnabled(is_butter_filtfilt)
+        self.filtHigh_spin.setEnabled(is_butter_filtfilt)
+        # Assuming filter order and type are fixed for now, but if they were widgets:
+        # self.filterOrder_spin.setEnabled(is_butter_filtfilt)
+        # self.filterButterType_combo.setEnabled(is_butter_filtfilt)
+
+        # Filtfilt padding specific params
+        self.padType_combo.setEnabled(is_filtfilt_only)
+        self.padLen_spin.setEnabled(is_filtfilt_only)
+
+        # EMA specific params
+        self.emaAlpha_spin.setEnabled(is_ema)
 
     def closeEvent(self, event):
         """Stops timer on close."""

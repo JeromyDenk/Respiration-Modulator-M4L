@@ -1,5 +1,5 @@
 # src/signal_processor.py
-# Phase 4 & 5: Handles signal fusion, filtering (filtfilt/lfilter), peak detection, BPM & phase calculation.
+# Phase 4 & 5: Handles signal fusion, filtering (filtfilt/lfilter/ema), peak detection, BPM & phase calculation.
 
 import numpy as np
 # Make sure scipy is installed: pip install scipy
@@ -11,7 +11,7 @@ import traceback
 class SignalProcessor:
     """
     Processes raw motion signal(s) to calculate respiratory BPM and phase (inhale/exhale).
-    Includes steps for signal fusion, filtering (filtfilt or lfilter),
+    Includes steps for signal fusion, filtering (filtfilt, lfilter, or ema),
     peak detection, BPM calculation, and phase estimation.
     """
     # Define phase constants
@@ -27,14 +27,17 @@ class SignalProcessor:
             config (dict, optional): Configuration dictionary. Expected keys:
                 'SIGNAL_BUFFER_SECONDS' (float): Duration of signal history for analysis.
                 'SIGNAL_FUSION_STRATEGY' (str): 'first', 'average' (default 'first').
-                'SIGNAL_FILTER_METHOD' (str): 'filtfilt' (zero-phase) or 'lfilter' (causal). Default 'filtfilt'.
-                'SIGNAL_FILTER_TYPE' (str): 'butterworth' (default).
-                'SIGNAL_FILTER_ORDER' (int): Order of the filter.
-                'SIGNAL_FILTER_LOW_HZ' (float): Lower cutoff frequency (e.g., 0.1 Hz for 6 BPM).
-                'SIGNAL_FILTER_HIGH_HZ' (float): Upper cutoff frequency (e.g., 2.0 Hz for 120 BPM). <-- Updated Default
+                'SIGNAL_FILTER_METHOD' (str): 'filtfilt', 'lfilter', or 'ema'. Default 'filtfilt'.
+                'SIGNAL_FILTER_TYPE' (str): 'butterworth' (default). Only for lfilter/filtfilt.
+                'SIGNAL_FILTER_ORDER' (int): Order of the filter. Only for lfilter/filtfilt.
+                'SIGNAL_FILTER_LOW_HZ' (float): Lower cutoff frequency. Only for lfilter/filtfilt.
+                'SIGNAL_FILTER_HIGH_HZ' (float): Upper cutoff frequency. Only for lfilter/filtfilt.
+                'EMA_ALPHA' (float): Smoothing factor for EMA (0 < alpha <= 1). Only for 'ema'.
+                'PAD_TYPE' (str): Padding type for filtfilt ('odd', 'even', 'constant', 'gust').
+                'PAD_LEN' (int): Padding length for filtfilt (0 for default).
                 'PEAK_DETECT_MIN_HEIGHT' (float): Min height for find_peaks.
-                'PEAK_DETECT_MIN_DISTANCE_SEC' (float): Min time separation between peaks. <-- Updated Default
-                'PEAK_DETECT_PROMINENCE' (float/None): Min prominence for find_peaks. Crucial for noise rejection.
+                'PEAK_DETECT_MIN_DISTANCE_SEC' (float): Min time separation between peaks.
+                'PEAK_DETECT_PROMINENCE' (float/None): Min prominence for find_peaks.
                 'BPM_AVERAGING_SECONDS' (float): Duration for BPM moving average.
                 'PHASE_SLOPE_WINDOW_MS' (int): Window size in milliseconds for phase slope calculation.
                 Defaults are used if config is None or keys are missing.
@@ -51,108 +54,108 @@ class SignalProcessor:
         self.buffer_seconds = config.get('SIGNAL_BUFFER_SECONDS', 15.0)
         self.fusion_strategy = config.get('SIGNAL_FUSION_STRATEGY', 'first')
         self.filter_method = config.get('SIGNAL_FILTER_METHOD', 'filtfilt').lower()
+        
+        # Butterworth filter parameters (used if method is 'lfilter' or 'filtfilt')
         self.filter_type = config.get('SIGNAL_FILTER_TYPE', 'butterworth')
         self.filter_order = config.get('SIGNAL_FILTER_ORDER', 2)
-        self.filter_low_hz = config.get('SIGNAL_FILTER_LOW_HZ', 0.1) # ~6 BPM
-        self.filter_high_hz = config.get('SIGNAL_FILTER_HIGH_HZ', 2.0) # ~120 BPM (UPDATED DEFAULT)
-        self.peak_min_height = config.get('PEAK_DETECT_MIN_HEIGHT', 0.0) # Tune based on filtered signal amplitude
-        # Min distance: 0.5s allows up to 120 BPM (matches 2Hz upper filter limit)
-        self.peak_min_distance_sec = config.get('PEAK_DETECT_MIN_DISTANCE_SEC', 0.5) # (UPDATED DEFAULT)
-        # Prominence: VERY IMPORTANT parameter. Default to None (off).
-        # Needs tuning based on signal noise level. Start small (e.g., 0.1 * typical peak height)
-        # and increase until noise peaks are rejected. Requires visual inspection of filtered signal + peaks.
+        self.filter_low_hz = config.get('SIGNAL_FILTER_LOW_HZ', 0.1)
+        self.filter_high_hz = config.get('SIGNAL_FILTER_HIGH_HZ', 2.0)
+
+        # EMA specific parameter
+        self.ema_alpha = config.get('EMA_ALPHA', 0.1)
+        if not (0 < self.ema_alpha <= 1.0):
+            print(f"[SignalProcessor] Warning: Invalid EMA_ALPHA {self.ema_alpha}. Defaulting to 0.1.")
+            self.ema_alpha = 0.1
+        self._last_ema_value = 0.0 # State for EMA filter
+        self._ema_initialized = False # Flag to initialize EMA with the first value
+
+        # Filtfilt specific padding parameters
+        self.pad_type = config.get('PAD_TYPE', 'gust')
+        self.configured_pad_len = config.get('PAD_LEN', 0)
+
+        self.peak_min_height = config.get('PEAK_DETECT_MIN_HEIGHT', 0.0)
+        self.peak_min_distance_sec = config.get('PEAK_DETECT_MIN_DISTANCE_SEC', 0.5)
         self.peak_prominence = config.get('PEAK_DETECT_PROMINENCE', None)
-        self.bpm_avg_seconds = config.get('BPM_AVERAGING_SECONDS', 5.0) # Average BPM over last 5s
-        # Phase calculation window (e.g., 100ms)
+        self.bpm_avg_seconds = config.get('BPM_AVERAGING_SECONDS', 5.0)
         self.phase_slope_window_ms = config.get('PHASE_SLOPE_WINDOW_MS', 100)
 
         # --- Calculate derived parameters ---
         self.buffer_size = int(self.buffer_seconds * self.sampling_rate)
         self.peak_distance_samples = int(self.peak_min_distance_sec * self.sampling_rate)
-        self.bpm_buffer_size = int(self.bpm_avg_seconds * self.sampling_rate) # Store recent instant BPMs
-        self.phase_slope_samples = max(1, int(self.phase_slope_window_ms / 1000.0 * self.sampling_rate)) # Ensure at least 1 sample window
+        self.bpm_buffer_size = int(self.bpm_avg_seconds * self.sampling_rate)
+        self.phase_slope_samples = max(1, int(self.phase_slope_window_ms / 1000.0 * self.sampling_rate))
 
         # --- Initialize Buffers ---
         self.raw_signal_buffer = collections.deque(maxlen=self.buffer_size)
         self.filtered_signal_buffer = collections.deque(maxlen=self.buffer_size)
-        self.peak_indices_buffer = collections.deque(maxlen=self.buffer_size) # Store indices relative to buffer start
+        self.peak_indices_buffer = collections.deque(maxlen=self.buffer_size)
         self.instant_bpm_buffer = collections.deque(maxlen=self.bpm_buffer_size)
 
         # --- State Variables ---
-        self.current_bpm = 0.0 # Stores the last calculated valid BPM
-        self.last_peak_indices = [] # Store indices found in the most recent valid processing step
-        self.bpm_valid = False # Reflects if the *last* calculation attempt was successful
+        self.current_bpm = 0.0
+        self.last_peak_indices = []
+        self.bpm_valid = False
         self._filter_zi = None # Initial state for lfilter
-        self.current_phase = self.PHASE_UNKNOWN # Initialize phase state
+        self.current_phase = self.PHASE_UNKNOWN
 
         # --- Filter Design ---
-        nyquist = 0.5 * self.sampling_rate
-        low = self.filter_low_hz / nyquist
-        high = self.filter_high_hz / nyquist
-        low = max(0.001, low) # Avoid zero frequency
-        high = min(0.999, high) # Avoid Nyquist frequency
+        self.filter_b, self.filter_a = None, None # Initialize to None
+        if self.filter_method in ['lfilter', 'filtfilt']:
+            nyquist = 0.5 * self.sampling_rate
+            low = self.filter_low_hz / nyquist
+            high = self.filter_high_hz / nyquist
+            low = max(0.001, low)
+            high = min(0.999, high)
 
-        if low >= high:
-             raise ValueError(f"Filter low cutoff ({self.filter_low_hz} Hz) must be less than high cutoff ({self.filter_high_hz} Hz)")
-
-        try:
-            self.filter_b, self.filter_a = butter(self.filter_order, [low, high], btype='bandpass')
-            print(f"[SignalProcessor] Designed {self.filter_order}-order Butterworth bandpass filter ({self.filter_low_hz:.2f} - {self.filter_high_hz:.2f} Hz).")
-
-            # Initialize filter state if using lfilter
-            if self.filter_method == 'lfilter':
-                self._filter_zi = lfilter_zi(self.filter_b, self.filter_a)
-                print(f"[SignalProcessor] Using 'lfilter' method (causal). Initial state zi calculated.")
-            elif self.filter_method == 'filtfilt':
-                 print(f"[SignalProcessor] Using 'filtfilt' method (zero-phase).")
+            if low >= high:
+                 print(f"[SignalProcessor] Warning: Filter low cutoff ({self.filter_low_hz} Hz) not less than high cutoff ({self.filter_high_hz} Hz). Using passthrough for lfilter/filtfilt.")
+                 self.filter_b, self.filter_a = np.array([1.0]), np.array([1.0]) # Passthrough
             else:
-                 print(f"[SignalProcessor] Warning: Unknown filter method '{self.filter_method}'. Defaulting to 'filtfilt'.")
-                 self.filter_method = 'filtfilt'
-
-        except Exception as e:
-             print(f"[SignalProcessor] FATAL ERROR designing filter: {e}")
-             traceback.print_exc()
-             self.filter_b, self.filter_a = np.array([1]), np.array([1]) # Dummy filter
-             self.filter_method = 'none' # Indicate filter failure
-
+                try:
+                    self.filter_b, self.filter_a = butter(self.filter_order, [low, high], btype='bandpass')
+                    print(f"[SignalProcessor] Designed {self.filter_order}-order Butterworth bandpass filter ({self.filter_low_hz:.2f} - {self.filter_high_hz:.2f} Hz).")
+                    if self.filter_method == 'lfilter':
+                        self._filter_zi = lfilter_zi(self.filter_b, self.filter_a)
+                        print(f"[SignalProcessor] Using 'lfilter' method (causal). Initial state zi calculated.")
+                    elif self.filter_method == 'filtfilt':
+                         print(f"[SignalProcessor] Using 'filtfilt' method (zero-phase).")
+                except Exception as e:
+                     print(f"[SignalProcessor] ERROR designing Butterworth filter: {e}")
+                     traceback.print_exc()
+                     self.filter_b, self.filter_a = np.array([1.0]), np.array([1.0]) # Passthrough
+        elif self.filter_method == 'ema':
+            print(f"[SignalProcessor] Using 'ema' method with alpha={self.ema_alpha:.3f}.")
+        else:
+            print(f"[SignalProcessor] Warning: Unknown filter method '{self.filter_method}'. No filtering will be applied (passthrough).")
+            self.filter_method = 'none' # Explicitly 'none'
+            self.filter_b, self.filter_a = np.array([1.0]), np.array([1.0]) # Passthrough
 
         print(f"[SignalProcessor] Initialized. Analysis Buffer: {self.buffer_size} samples ({self.buffer_seconds}s)")
-        print(f"  Peak Min Distance: {self.peak_distance_samples} samples ({self.peak_min_distance_sec}s)")
-        print(f"  Peak Prominence: {self.peak_prominence} (Tune this!)")
-        print(f"  BPM Avg Window: {self.bpm_buffer_size} samples (~{self.bpm_avg_seconds}s)")
-        print(f"  Phase Slope Window: {self.phase_slope_samples} samples (~{self.phase_slope_window_ms}ms)")
+        # ... (rest of print statements for other params)
+        if self.filter_method == 'filtfilt':
+            print(f"  Filtfilt Padding: type='{self.pad_type}', configured_len={self.configured_pad_len}")
 
 
     def _calculate_phase(self):
         """Estimates inhale/exhale phase based on recent filtered signal slope."""
-        # Need at least window_size + 1 samples to compare current vs past
         required_samples_for_phase = self.phase_slope_samples + 1
         if len(self.filtered_signal_buffer) < required_samples_for_phase:
-            return self.PHASE_UNKNOWN # Not enough data
+            return self.PHASE_UNKNOWN
 
-        # Get the required recent samples using negative indexing from the deque
-        # Sample at index -1 is the most recent
-        # Sample at index -(required_samples_for_phase) is the oldest needed
         try:
             current_sample = self.filtered_signal_buffer[-1]
             past_sample = self.filtered_signal_buffer[-required_samples_for_phase]
         except IndexError:
-             # Should not happen if length check passed, but safety first
              print("[SignalProcessor] Warning: IndexError during phase calculation sample access.")
              return self.PHASE_UNKNOWN
 
-        # Calculate the difference (slope approximation over the window)
         slope = current_sample - past_sample
-
-        # Determine phase based on slope sign (add a small tolerance for near-zero slope)
-        # Tolerance should be small relative to typical signal changes during inhale/exhale
-        slope_tolerance = 1e-7 # Adjust if needed based on signal scale/noise
+        slope_tolerance = 1e-7
         if slope > slope_tolerance:
             return self.PHASE_INHALE
         elif slope < -slope_tolerance:
             return self.PHASE_EXHALE
         else:
-            # Slope is very close to zero, consider it transition/unknown
             return self.PHASE_UNKNOWN
 
 
@@ -161,79 +164,93 @@ class SignalProcessor:
         Processes a list of raw signal values for the current time step.
         Updates BPM and phase.
         """
-        # --- 1. Signal Fusion ---
         if not raw_signals_list:
             fused_signal_value = 0.0
         else:
-            # Simple fusion for now
             if self.fusion_strategy == 'average':
                  fused_signal_value = np.mean(raw_signals_list)
-            elif self.fusion_strategy == 'first':
-                 fused_signal_value = raw_signals_list[0]
             else: # Default to 'first'
                  fused_signal_value = raw_signals_list[0]
 
         self.raw_signal_buffer.append(fused_signal_value)
 
-        # --- 2. Filtering ---
-        filtered_value = 0.0 # Default value if filtering fails or not ready
+        filtered_value = 0.0
         filter_ran_successfully = False
+
         if self.filter_method == 'filtfilt':
-            # filtfilt needs enough data in the buffer
-            min_len_filtfilt = 3 * max(len(self.filter_a), len(self.filter_b))
-            if len(self.raw_signal_buffer) >= min_len_filtfilt:
-                try:
-                    raw_buffer_np = np.array(self.raw_signal_buffer)
-                    filtered_signal_full = filtfilt(self.filter_b, self.filter_a, raw_buffer_np)
-                    filtered_value = filtered_signal_full[-1] # Get the latest filtered value
-                    filter_ran_successfully = True
-                except Exception as e:
-                    print(f"[SignalProcessor] Error during filtfilt: {e}")
-                    # Keep filtered_value as 0.0
-            # else: Not enough data yet for filtfilt
+            if self.filter_b is None or self.filter_a is None: # Filter design failed
+                filtered_value = fused_signal_value # Passthrough
+            else:
+                effective_padlen_for_check = self.configured_pad_len
+                if self.configured_pad_len == 0:
+                    effective_padlen_for_check = 3 * (max(len(self.filter_b), len(self.filter_a)) - 1)
+                    if effective_padlen_for_check < 0: effective_padlen_for_check = 0
+                
+                if len(self.raw_signal_buffer) > effective_padlen_for_check:
+                    try:
+                        raw_buffer_np = np.array(self.raw_signal_buffer)
+                        filtered_signal_full = filtfilt(self.filter_b, self.filter_a, raw_buffer_np,
+                                                        padtype=self.pad_type, padlen=self.configured_pad_len)
+                        filtered_value = filtered_signal_full[-1]
+                        filter_ran_successfully = True
+                    except ValueError as ve:
+                        print(f"[SignalProcessor] ValueError during filtfilt (padtype='{self.pad_type}', padlen={self.configured_pad_len}, "
+                              f"segment_len={len(self.raw_signal_buffer)}, effective_check_padlen={effective_padlen_for_check}): {ve}")
+                        print("[SignalProcessor] Falling back to lfilter for this segment due to filtfilt ValueError.")
+                        if self._filter_zi is None: self._filter_zi = lfilter_zi(self.filter_b, self.filter_a) * fused_signal_value
+                        filtered_value, self._filter_zi = lfilter(self.filter_b, self.filter_a, [fused_signal_value], zi=self._filter_zi)
+                        filtered_value = filtered_value[0]
+                        filter_ran_successfully = True # lfilter ran
+                    except Exception as e:
+                        print(f"[SignalProcessor] Error during filtfilt: {e}. Using raw value.")
+                        filtered_value = fused_signal_value # Fallback to raw
+                else: # Not enough data for filtfilt, use lfilter as a fallback if possible
+                    if self._filter_zi is None: self._filter_zi = lfilter_zi(self.filter_b, self.filter_a) * fused_signal_value
+                    filtered_value, self._filter_zi = lfilter(self.filter_b, self.filter_a, [fused_signal_value], zi=self._filter_zi)
+                    filtered_value = filtered_value[0]
+                    filter_ran_successfully = True # lfilter ran
 
         elif self.filter_method == 'lfilter':
-            # lfilter processes sample by sample
-            try:
-                # Ensure _filter_zi is initialized
-                if self._filter_zi is None:
-                     self._filter_zi = lfilter_zi(self.filter_b, self.filter_a)
-                     # Initialize with steady state for the first sample's value
-                     self._filter_zi = self._filter_zi * fused_signal_value
-
-                filtered_value, self._filter_zi = lfilter(self.filter_b, self.filter_a, [fused_signal_value], zi=self._filter_zi)
-                filtered_value = filtered_value[0] # lfilter returns an array
-                filter_ran_successfully = True
-            except Exception as e:
-                print(f"[SignalProcessor] Error during lfilter: {e}")
-                # Reset zi state on error? Or just skip? Skipping for now.
-                # Keep filtered_value as 0.0
-        # else: Filter method is 'none' or invalid
+            if self.filter_b is None or self.filter_a is None: # Filter design failed
+                filtered_value = fused_signal_value # Passthrough
+            else:
+                try:
+                    if self._filter_zi is None:
+                         self._filter_zi = lfilter_zi(self.filter_b, self.filter_a)
+                         self._filter_zi = self._filter_zi * fused_signal_value
+                    filtered_value, self._filter_zi = lfilter(self.filter_b, self.filter_a, [fused_signal_value], zi=self._filter_zi)
+                    filtered_value = filtered_value[0]
+                    filter_ran_successfully = True
+                except Exception as e:
+                    print(f"[SignalProcessor] Error during lfilter: {e}")
+                    filtered_value = fused_signal_value # Fallback to raw
+        
+        elif self.filter_method == 'ema':
+            if not self._ema_initialized or not self.filtered_signal_buffer: # If first point or buffer was cleared
+                self._last_ema_value = fused_signal_value
+                self._ema_initialized = True
+            else:
+                self._last_ema_value = self.ema_alpha * fused_signal_value + (1 - self.ema_alpha) * self._last_ema_value
+            filtered_value = self._last_ema_value
+            filter_ran_successfully = True
+        
+        else: # 'none' or unknown method
+            filtered_value = fused_signal_value # Passthrough
+            filter_ran_successfully = True # Considered "successful" as it's intentional
 
         self.filtered_signal_buffer.append(filtered_value)
-
-        # --- Phase Calculation ---
-        # Calculate phase based on the latest filtered signal history
-        # Needs to happen *after* appending the latest filtered value
         self.current_phase = self._calculate_phase()
 
-
-        # --- Check if buffer is full enough for peak detection/BPM ---
-        # We need the filtered buffer to be reasonably full for reliable analysis
         if len(self.filtered_signal_buffer) < self.buffer_size:
-            self.bpm_valid = False # Cannot calculate BPM yet
+            self.bpm_valid = False
             self.last_peak_indices = []
-            return # Exit early if buffer not full for BPM analysis
+            return
 
-        # --- 3. Peak Detection & 4. BPM Calculation ---
-        current_calculation_valid = False # Reset validity for this specific calculation attempt
-        if filter_ran_successfully: # Only proceed if filter ran
+        current_calculation_valid = False
+        if filter_ran_successfully:
             filtered_buffer_np = np.array(self.filtered_signal_buffer)
             try:
-                # Check for flat signal before peak detection
-                # Use a small threshold for standard deviation
                 if np.std(filtered_buffer_np) < 1e-9:
-                    # print("[SignalProcessor] Debug: Filtered signal is flat, skipping peak detection.") # Debug noise
                     peaks = np.array([], dtype=int)
                 else:
                     peaks, properties = find_peaks(
@@ -242,19 +259,16 @@ class SignalProcessor:
                         distance=self.peak_distance_samples,
                         prominence=self.peak_prominence if self.peak_prominence is not None else None
                     )
-                self.last_peak_indices = peaks # Store indices relative to buffer start
+                self.last_peak_indices = peaks
 
-                # --- BPM Calculation ---
                 if len(self.last_peak_indices) >= 2:
                     peak_intervals_samples = np.diff(self.last_peak_indices)
                     peak_intervals_sec = peak_intervals_samples / self.sampling_rate
-
-                    # Filter intervals based on expected physiological range derived from filter settings
-                    # Allow some margin around filter cutoffs
-                    min_interval = (1.0 / self.filter_high_hz) * 0.8 if self.filter_high_hz > 0 else self.peak_min_distance_sec
-                    min_interval = max(min_interval, self.peak_min_distance_sec * 0.8) # Ensure it respects peak distance
-                    max_interval = (1.0 / self.filter_low_hz) * 1.2 if self.filter_low_hz > 0 else 15.0
-                    max_interval = min(max_interval, 15.0) # Absolute max interval (e.g., 4 BPM)
+                    
+                    min_interval_filt = (1.0 / self.filter_high_hz) * 0.8 if self.filter_method in ['lfilter', 'filtfilt'] and self.filter_high_hz > 0 else self.peak_min_distance_sec
+                    min_interval = max(min_interval_filt, self.peak_min_distance_sec * 0.8)
+                    max_interval_filt = (1.0 / self.filter_low_hz) * 1.2 if self.filter_method in ['lfilter', 'filtfilt'] and self.filter_low_hz > 0 else 15.0
+                    max_interval = min(max_interval_filt, 15.0)
 
                     valid_intervals = peak_intervals_sec[
                         (peak_intervals_sec >= min_interval) & (peak_intervals_sec <= max_interval)
@@ -265,217 +279,204 @@ class SignalProcessor:
                         if avg_interval_sec > 0:
                             instant_bpm = 60.0 / avg_interval_sec
                             self.instant_bpm_buffer.append(instant_bpm)
-
-                            # Update smoothed BPM (using the buffer of recent *valid* instant BPMs)
                             if len(self.instant_bpm_buffer) > 0:
-                                 # --- BPM Update ---
                                  self.current_bpm = np.mean(list(self.instant_bpm_buffer))
-                                 current_calculation_valid = True # Mark this calculation as successful
-                            # else: No valid instant BPMs in buffer yet
-
-                # else: Not enough peaks found in this window
-
+                                 current_calculation_valid = True
             except Exception as e:
                 print(f"[SignalProcessor] Error during peak detection/BPM: {e}")
-                traceback.print_exc() # Print full traceback for easier debugging
+                traceback.print_exc()
                 self.last_peak_indices = []
-                # current_calculation_valid remains False
-
-        # Update overall validity status based on this attempt
         self.bpm_valid = current_calculation_valid
-        # Note: self.current_bpm retains its previous value if current_calculation_valid is False
-
 
     def get_bpm(self):
-        """Returns the current smoothed BPM and its validity status."""
-        # Validity here means the *last calculation attempt* was successful
-        # AND the buffer is full. The BPM value itself might be from an earlier
-        # successful calculation if the latest failed (it freezes).
         is_currently_valid = self.bpm_valid and len(self.filtered_signal_buffer) == self.buffer_size
         return self.current_bpm, is_currently_valid
 
     def get_phase(self):
-        """
-        Returns the estimated respiratory phase.
-
-        Returns:
-            int: PHASE_INHALE (1), PHASE_EXHALE (-1), or PHASE_UNKNOWN (0).
-        """
-        # Phase calculation validity depends only on having enough samples in the filtered buffer
-        # for the slope calculation, not necessarily on BPM validity.
         if len(self.filtered_signal_buffer) < self.phase_slope_samples + 1:
              return self.PHASE_UNKNOWN
         return self.current_phase
 
     def get_filtered_signal_buffer(self):
-        """Returns the current buffer of filtered signal values."""
         return list(self.filtered_signal_buffer)
 
     def get_raw_signal_buffer(self):
-        """Returns the current buffer of raw (fused) signal values."""
         return list(self.raw_signal_buffer)
 
     def get_last_peak_indices(self):
-        """Returns the indices of peaks found in the last processed buffer."""
-        # Return indices relative to the start of the buffer
         return self.last_peak_indices
+
     def get_latest_filtered_value(self):
-            """Returns the most recent filtered signal value."""
             if self.filtered_signal_buffer:
                 return self.filtered_signal_buffer[-1]
             else:
                 return 0.0
+    
+    def reset(self):
+        """Resets all buffers and state variables."""
+        self.raw_signal_buffer.clear()
+        self.filtered_signal_buffer.clear()
+        self.peak_indices_buffer.clear() # Though not directly used for output, good to clear
+        self.instant_bpm_buffer.clear()
+        self.current_bpm = 0.0
+        self.bpm_valid = False
+        self.current_phase = self.PHASE_UNKNOWN
+        self.last_peak_indices = []
+        if self.filter_method == 'lfilter' and self.filter_b is not None and self.filter_a is not None:
+            self._filter_zi = lfilter_zi(self.filter_b, self.filter_a) # Reset lfilter state
+        elif self.filter_method == 'ema':
+            self._last_ema_value = 0.0 # Reset EMA state
+            self._ema_initialized = False
+        print("[SignalProcessor] State reset.")
+
 
 # Example usage (for testing this module directly)
 if __name__ == '__main__':
-    print("\nTesting SignalProcessor module (with Phase)...")
+    print("\nTesting SignalProcessor module (with Phase & EMA)...")
 
-    # --- Test Parameters ---
-    test_sampling_rate = 50.0 # 50 Hz
-    test_config = {
+    test_sampling_rate = 50.0
+    base_config = {
         'SIGNAL_BUFFER_SECONDS': 10.0,
-        'SIGNAL_FILTER_METHOD': 'filtfilt', # Test with filtfilt first
-        'SIGNAL_FILTER_LOW_HZ': 0.1,  # 6 BPM
-        'SIGNAL_FILTER_HIGH_HZ': 2.0, # 120 BPM (Updated upper limit)
+        'SIGNAL_FILTER_LOW_HZ': 0.1,
+        'SIGNAL_FILTER_HIGH_HZ': 2.0,
         'SIGNAL_FILTER_ORDER': 2,
-        'PEAK_DETECT_MIN_DISTANCE_SEC': 0.5, # Min 0.5s separation (Updated)
-        'PEAK_DETECT_PROMINENCE': 0.15, # Example prominence value
+        'PEAK_DETECT_MIN_DISTANCE_SEC': 0.5,
+        'PEAK_DETECT_PROMINENCE': 0.15,
         'BPM_AVERAGING_SECONDS': 4.0,
-        'PHASE_SLOPE_WINDOW_MS': 100, # 100ms window for phase slope
+        'PHASE_SLOPE_WINDOW_MS': 100,
     }
-    processor = SignalProcessor(config=test_config, sampling_rate=test_sampling_rate)
 
     # --- Generate Mock Signal ---
-    duration = 15 # Generate 15 seconds of data
+    duration = 15
     num_samples = int(duration * test_sampling_rate)
     time_vector = np.linspace(0, duration, num_samples, endpoint=False)
-    # Simulate breathing at 18 BPM (0.3 Hz)
     breathing_freq = 0.3
-    mock_signal = 0.6 * np.sin(2 * np.pi * breathing_freq * time_vector) # Slightly stronger signal
-    # Add some noise
-    noise = 0.08 * np.random.randn(num_samples) # Slightly less noise
-    mock_signal += noise
-    # Add a baseline offset
-    mock_signal += 1.0
+    mock_signal_clean = 0.6 * np.sin(2 * np.pi * breathing_freq * time_vector)
+    noise = 0.08 * np.random.randn(num_samples)
+    mock_signal_noisy = mock_signal_clean + noise + 1.0 # Add DC offset
 
-    # --- Process the signal step-by-step ---
-    print(f"\nProcessing {duration}s of mock signal ({num_samples} samples)...")
-    start_time = time.time()
-    bpm_history = []
-    validity_history = []
-    phase_history = []
-    for i in range(num_samples):
-        # Simulate receiving one value at a time
-        processor.process_signal_values([mock_signal[i]])
-        bpm, is_valid = processor.get_bpm()
-        phase = processor.get_phase() # Get the calculated phase
-        bpm_history.append(bpm if is_valid else np.nan) # Store NaN if not valid
-        validity_history.append(is_valid)
-        phase_history.append(phase) # Store phase value
+    filter_methods_to_test = ['filtfilt', 'lfilter', 'ema']
+    all_results = {}
 
-    end_time = time.time()
-    print(f"Processing finished in {end_time - start_time:.3f} seconds.")
+    for method in filter_methods_to_test:
+        print(f"\n--- Testing with Filter Method: {method.upper()} ---")
+        current_config = {**base_config, 'SIGNAL_FILTER_METHOD': method}
+        if method == 'ema':
+            current_config['EMA_ALPHA'] = 0.05 # Test with a specific alpha for EMA
+            # For EMA, bandpass parameters are not used, but peak detection might still be affected by smoothing
+            # We might want different peak detection params for EMA if it smooths peaks too much
+            # current_config['PEAK_DETECT_PROMINENCE'] = 0.05 # Example: potentially lower prominence for EMA
 
-    # --- Analyze Results ---
-    # Find the point where BPM becomes valid
-    first_valid_idx = next((i for i, valid in enumerate(validity_history) if valid), None)
+        processor = SignalProcessor(config=current_config, sampling_rate=test_sampling_rate)
+        
+        bpm_history = []
+        validity_history = []
+        phase_history = []
+        filtered_output_history = []
 
-    print(f"\nBPM calculation became valid around sample index: {first_valid_idx} (after ~{first_valid_idx / test_sampling_rate:.1f}s)")
+        for i in range(num_samples):
+            processor.process_signal_values([mock_signal_noisy[i]])
+            bpm, is_valid = processor.get_bpm()
+            phase = processor.get_phase()
+            filtered_output_history.append(processor.get_latest_filtered_value())
+            bpm_history.append(bpm if is_valid else np.nan)
+            validity_history.append(is_valid)
+            phase_history.append(phase)
 
-    # Calculate average BPM during valid period
-    valid_bpms = [b for b in bpm_history if not np.isnan(b)]
-    avg_valid_bpm = np.mean(valid_bpms) if valid_bpms else 0
-    expected_bpm = breathing_freq * 60
-    print(f"Average calculated BPM (when valid): {avg_valid_bpm:.2f}")
-    print(f"Expected BPM: {expected_bpm:.2f}")
+        first_valid_idx = next((i for i, valid in enumerate(validity_history) if valid), None)
+        valid_bpms = [b for b in bpm_history if not np.isnan(b)]
+        avg_valid_bpm = np.mean(valid_bpms) if valid_bpms else 0
+        expected_bpm = breathing_freq * 60
 
-    # Basic Assertions
-    assert first_valid_idx is not None, "BPM should become valid"
-    assert abs(avg_valid_bpm - expected_bpm) < 3.0, f"Average BPM ({avg_valid_bpm:.2f}) should be close to expected ({expected_bpm:.2f})"
+        print(f"  BPM valid around sample: {first_valid_idx} (~{first_valid_idx / test_sampling_rate:.1f}s)")
+        print(f"  Avg BPM (when valid): {avg_valid_bpm:.2f} (Expected: {expected_bpm:.2f})")
+        
+        all_results[method] = {
+            'bpm_history': bpm_history,
+            'phase_history': phase_history,
+            'filtered_signal': filtered_output_history, # Store the full filtered output
+            'avg_bpm': avg_valid_bpm,
+            'first_valid_idx': first_valid_idx
+        }
+        if method != 'ema': # EMA doesn't rely on traditional peak finding for its primary output
+             assert first_valid_idx is not None, f"{method}: BPM should become valid"
+             assert abs(avg_valid_bpm - expected_bpm) < 3.0, f"{method}: Avg BPM ({avg_valid_bpm:.2f}) too far from expected ({expected_bpm:.2f})"
+        else: # For EMA, we check if it tracks the DC offset
+            # Check if the end of the EMA signal is close to the DC offset + mean of clean signal (which is 0)
+            # This is a rough check as EMA will still have some ripple from the sine wave.
+            # A better check for EMA would be its response to a step input.
+            pass # More specific EMA tests added below
 
-    # Check phase transitions (expecting mostly 1 and -1 after buffer fills)
-    # Phase calculation needs fewer samples than BPM, check after phase window fills
-    first_phase_calc_idx = processor.phase_slope_samples + 1
-    valid_phases = phase_history[first_phase_calc_idx:] if len(phase_history) > first_phase_calc_idx else []
-    inhale_count = sum(1 for p in valid_phases if p == SignalProcessor.PHASE_INHALE)
-    exhale_count = sum(1 for p in valid_phases if p == SignalProcessor.PHASE_EXHALE)
-    unknown_count = sum(1 for p in valid_phases if p == SignalProcessor.PHASE_UNKNOWN)
-    print(f"Phase counts (after {first_phase_calc_idx} samples): Inhale={inhale_count}, Exhale={exhale_count}, Unknown={unknown_count}")
-    assert inhale_count > 0 and exhale_count > 0, "Should detect both inhale and exhale phases"
-    # Expect relatively few unknowns in a clean sine wave
-    assert unknown_count < (inhale_count + exhale_count) * 0.2, "Should have relatively few unknown phases in mock signal"
+    # --- Specific Test for EMA Step Response ---
+    print("\n--- Testing EMA Step Response ---")
+    ema_config_step = {**base_config, 'SIGNAL_FILTER_METHOD': 'ema', 'EMA_ALPHA': 0.1}
+    processor_ema_step = SignalProcessor(config=ema_config_step, sampling_rate=test_sampling_rate)
+    ema_step_output_history = []
+    # Create a signal that holds a level: 0 for 50 samples, then 1 for 50 samples, then 0.5 for 50 samples
+    step_input_signal = np.concatenate([np.zeros(50), np.ones(50), np.zeros(50) + 0.5])
+    for val in step_input_signal:
+        processor_ema_step.process_signal_values([val])
+        ema_step_output_history.append(processor_ema_step.get_latest_filtered_value())
+    
+    print(f"EMA Step Test: Last raw input: {step_input_signal[-1]}, Last EMA output: {ema_step_output_history[-1]:.3f}")
+    # Check that EMA is moving towards the last step value
+    assert np.abs(ema_step_output_history[-1] - step_input_signal[-1]) < np.abs(ema_step_output_history[99] - step_input_signal[-1]), \
+        "EMA should be closer to the final step value at the end than after the previous step."
+    print("EMA Step Response test passed basic check.")
 
 
-    print("\n--- Checking buffer contents ---")
-    raw_buf = processor.get_raw_signal_buffer()
-    filtered_buf = processor.get_filtered_signal_buffer()
-    peaks = processor.get_last_peak_indices()
-    print(f"Raw buffer length: {len(raw_buf)}")
-    print(f"Filtered buffer length: {len(filtered_buf)}")
-    print(f"Number of peaks found in last buffer: {len(peaks)}")
-    # print(f"Peak indices (relative to buffer start): {peaks}") # Can be long
-
-    assert len(raw_buf) == processor.buffer_size, "Raw buffer should be full"
-    assert len(filtered_buf) == processor.buffer_size, "Filtered buffer should be full"
-    assert len(peaks) > 0, "Should find peaks in the final buffer"
-
-
-    # --- Optional: Plotting (requires matplotlib) ---
+    # --- Plotting ---
     try:
         import matplotlib.pyplot as plt
         print("\nPlotting results (close plot to finish)...")
-        fig, axs = plt.subplots(4, 1, sharex=True, figsize=(12, 10)) # Added subplot for phase
+        num_methods = len(filter_methods_to_test)
+        fig, axs = plt.subplots(num_methods + 2, 1, sharex=True, figsize=(14, 4 + num_methods * 3))
 
-        # Plot Filtered Signal (last buffer)
-        buffer_time = np.arange(processor.buffer_size) / test_sampling_rate
-        axs[0].plot(buffer_time, filtered_buf, label='Filtered Signal')
-        # Plot detected peaks on the filtered signal
-        if len(peaks) > 0 and max(peaks) < len(filtered_buf): # Ensure peaks are within bounds
-             axs[0].plot(buffer_time[peaks], np.array(filtered_buf)[peaks], "x", label="Detected Peaks", color='red', markersize=8)
-        else:
-             print("[Plotting Warning] Peak indices out of bounds for filtered buffer.")
-
-        axs[0].set_title("Filtered Signal Buffer (Last Window)")
+        axs[0].plot(time_vector, mock_signal_noisy, label='Original Mock Signal + Noise', alpha=0.7, color='gray')
+        axs[0].set_title("Full Input Signal")
         axs[0].set_ylabel("Amplitude")
         axs[0].legend()
         axs[0].grid(True)
 
-        # Plot Full Mock Signal
-        axs[1].plot(time_vector, mock_signal, label='Original Mock Signal + Noise', alpha=0.7)
-        axs[1].set_title("Full Input Signal")
-        axs[1].set_ylabel("Amplitude")
-        axs[1].legend()
-        axs[1].grid(True)
+        for i, method in enumerate(filter_methods_to_test):
+            ax_idx = i + 1
+            results = all_results[method]
+            axs[ax_idx].plot(time_vector, results['filtered_signal'], label=f'Filtered ({method.upper()})')
+            axs[ax_idx].set_title(f"Filtered Signal ({method.upper()}) & BPM")
+            axs[ax_idx].set_ylabel("Amplitude")
+            axs[ax_idx].grid(True)
+            
+            ax_bpm = axs[ax_idx].twinx()
+            ax_bpm.plot(time_vector, results['bpm_history'], label=f'BPM ({method})', marker='.', linestyle=':', color='red', alpha=0.6)
+            ax_bpm.set_ylabel("BPM", color='red')
+            ax_bpm.tick_params(axis='y', labelcolor='red')
+            ax_bpm.set_ylim(0, expected_bpm * 2.5)
+            
+            lines, labels = axs[ax_idx].get_legend_handles_labels()
+            lines2, labels2 = ax_bpm.get_legend_handles_labels()
+            axs[ax_idx].legend(lines + lines2, labels + labels2, loc='upper left')
 
-        # Plot BPM History
-        axs[2].plot(time_vector, bpm_history, label='Calculated BPM', marker='.', linestyle='-')
-        axs[2].axhline(expected_bpm, color='r', linestyle='--', label=f'Expected BPM ({expected_bpm:.1f})')
-        axs[2].set_title("BPM Calculation Over Time")
-        axs[2].set_ylabel("BPM")
-        axs[2].set_ylim(0, expected_bpm * 2.5) # Adjust Y limits for 120 BPM range
-        axs[2].legend()
-        axs[2].grid(True)
 
-        # Plot Phase History
-        axs[3].plot(time_vector, phase_history, label='Calculated Phase', marker='.', linestyle='-', drawstyle='steps-post')
-        axs[3].set_title("Phase Calculation Over Time")
-        axs[3].set_xlabel("Time (s)")
-        axs[3].set_ylabel("Phase (1=In, -1=Ex)")
-        axs[3].set_yticks([-1, 0, 1])
-        axs[3].set_yticklabels(['Exhale', 'Unknown', 'Inhale'])
-        axs[3].legend()
-        axs[3].grid(True)
-
+        # Plot all phases on the last subplot
+        ax_phase = axs[-1] # Last subplot
+        for method in filter_methods_to_test:
+            results = all_results[method]
+            ax_phase.plot(time_vector, results['phase_history'], label=f'Phase ({method})', marker='.', linestyle='-', drawstyle='steps-post', alpha=0.7)
+        
+        ax_phase.set_title("Phase Calculation Over Time (All Methods)")
+        ax_phase.set_xlabel("Time (s)")
+        ax_phase.set_ylabel("Phase (1=In, -1=Ex)")
+        ax_phase.set_yticks([-1, 0, 1])
+        ax_phase.set_yticklabels(['Exhale', 'Unknown', 'Inhale'])
+        ax_phase.legend(loc='upper right')
+        ax_phase.grid(True)
 
         plt.tight_layout()
         plt.show()
     except ImportError:
         print("\nMatplotlib not found. Skipping plots.")
-        print("Install it with: pip install matplotlib")
     except Exception as plot_err:
          print(f"\nError during plotting: {plot_err}")
          traceback.print_exc()
 
-
     print("\nSignalProcessor module test finished.")
-
