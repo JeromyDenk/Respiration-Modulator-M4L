@@ -143,10 +143,14 @@ class FeatureTracker:
         did_detect_this_frame = {} # Track if detection happened THIS frame
 
         for i, roi in enumerate(current_rois):
-            good_old_points, good_new_points, good_qualities = None, None, None # Defaults for this ROI's output
+            # Initialize output for this ROI for the current frame
+            current_frame_status = "UNKNOWN_STATUS" # Default status
+            current_frame_old_points = None         # Old points used for LK, corresponding to new_points
+            current_frame_new_points = None         # Points tracked/detected in current_gray_frame
+            current_frame_qualities = None          # Qualities of current_frame_new_points
+
             features_for_current_tracking = self.features_to_track_per_roi.get(i)
             qualities_for_current_tracking = self.feature_qualities_per_roi.get(i) # Get corresponding qualities
-            num_features_for_current = len(features_for_current_tracking) if features_for_current_tracking is not None else 0
             last_tracked_count = self.last_tracked_count_per_roi.get(i, 0)
             was_detection_last_frame = self.did_detect_last_frame_per_roi.get(i, True) # Default to True if no history
 
@@ -156,7 +160,7 @@ class FeatureTracker:
             if self.prev_gray_frame is None:
                 needs_redetection = True
                 redetection_reason = "First frame"
-            elif features_for_current_tracking is None or num_features_for_current == 0:
+            elif features_for_current_tracking is None or len(features_for_current_tracking) == 0:
                  needs_redetection = True
                  redetection_reason = "No features available from previous cycle"
             # --- *** CORRECTED LOGIC V3 *** ---
@@ -172,12 +176,18 @@ class FeatureTracker:
                 print(f"[FeatureTracker Frame {self._frame_counter} ROI {i}] Redetecting features. Reason: {redetection_reason}")
                 detection_frame = self.prev_gray_frame if self.prev_gray_frame is not None else current_gray_frame
                 detected_features, detected_qualities = self._detect_features(detection_frame, roi) # Get qualities too
+
+                if detected_features is not None:
+                    current_frame_status = "DETECT_SUCCESS"
+                else:
+                    current_frame_status = "DETECT_NO_FEATURES"
+
                 next_features_to_track[i] = detected_features
                 next_feature_qualities[i] = detected_qualities # Store detected qualities
                 current_tracked_count[i] = 0 # No points tracked this frame
                 did_detect_this_frame[i] = True # Mark that detection happened
-                tracked_data_all_rois.append((None, None, None)) # Output includes None for qualities
                 # print(f"[FeatureTracker Frame {self._frame_counter} ROI {i}] Output: (None, None) due to redetection.") # Noisy
+                tracked_data_all_rois.append((current_frame_status, None, None, None)) # No old/new_points or qualities from tracking this frame
                 continue # Skip tracking
 
             # --- Feature Tracking Logic ---
@@ -198,33 +208,47 @@ class FeatureTracker:
                     # print(f"[FeatureTracker Frame {self._frame_counter} ROI {i}] LK Tracking: {num_tracked_ok}/{num_features_for_current} points tracked successfully.") # Noisy
 
                     if num_tracked_ok > 0: # If some points were tracked successfully
-                        good_new_points = next_points[valid_mask]
-                        good_old_points = features_for_current_tracking[valid_mask]
-                        next_features_to_track[i] = good_new_points.reshape(-1, 1, 2)
+                        current_frame_status = "TRACK_OK"
+                        current_frame_old_points = features_for_current_tracking[valid_mask] # These are the old points
+                        current_frame_new_points = next_points[valid_mask]
+                        next_features_to_track[i] = current_frame_new_points.reshape(-1, 1, 2)
+
                         # --- Keep corresponding qualities ---
                         if self.quality_weighting_enabled and qualities_for_current_tracking is not None:
-                            good_qualities = qualities_for_current_tracking[valid_mask]
-                            next_feature_qualities[i] = good_qualities # Store qualities for next frame
+                            current_frame_qualities = qualities_for_current_tracking[valid_mask]
+                            next_feature_qualities[i] = current_frame_qualities # Store qualities for next frame
                         else:
+                            # current_frame_qualities remains None
                             next_feature_qualities[i] = None # No qualities if weighting disabled or missing
                     else: # Tracking ran but lost all points
+                         current_frame_status = "TRACK_LOST_ALL"                         
+                         # old_points, new_points, qualities remain None
                          next_features_to_track[i] = None
                          next_feature_qualities[i] = None
                 else: # Tracking failed (returned None)
+                     current_frame_status = "TRACK_LK_FAILED" # e.g. calcOpticalFlowPyrLK returned None                     
+                     # old_points, new_points, qualities remain None                     
                      next_features_to_track[i] = None
                      next_feature_qualities[i] = None
 
             except cv2.error as e_lk: # Handle OpenCV specific errors
                 print(f"[FeatureTracker Frame {self._frame_counter} ROI {i}] OpenCV Error tracking features: {e_lk}")
+                current_frame_status = "TRACK_ERROR_CV"
                 next_features_to_track[i] = None; num_tracked_ok = 0
+                next_feature_qualities[i] = None # Ensure qualities are reset on error
             except Exception as e:
                 print(f"[FeatureTracker Frame {self._frame_counter} ROI {i}] Error tracking features: {e}")
-                traceback.print_exc(); next_features_to_track[i] = None; num_tracked_ok = 0
+                traceback.print_exc()
+                current_frame_status = "TRACK_ERROR_GENERIC"
+                # old_points, new_points, qualities remain None
+                next_features_to_track[i] = None; num_tracked_ok = 0
+                next_feature_qualities[i] = None # Ensure qualities are reset on error
+
 
             # Store the number of points successfully tracked *this frame*
             current_tracked_count[i] = num_tracked_ok
-            # Append the tracked points (or None if failed) for this ROI
-            tracked_data_all_rois.append((good_old_points, good_new_points, good_qualities)) # Include qualities
+            # Append the status, old points, new points, and qualities for this ROI
+            tracked_data_all_rois.append((current_frame_status, current_frame_old_points, current_frame_new_points, current_frame_qualities))
 
         # --- Update State for Next Frame ---
         self.prev_gray_frame = current_gray_frame.copy()

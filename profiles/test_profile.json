@@ -6,7 +6,11 @@
     "VIDEO_SOURCE": 0,
     "VIDEO_WIDTH": 1920,
     "VIDEO_HEIGHT": 1080,
-    "VIDEO_FPS": 30
+    "VIDEO_FPS": 30,
+    "VIDEO_API_PREFERENCE": 1400,
+    "VIDEO_MANUAL_EXPOSURE": true,
+    "VIDEO_EXPOSURE_VALUE": -5,
+    "VIDEO_ISO_VALUE": 1100
   },
   "pipeline_manager": {
     "POSE_DETECTION_FRAME_INTERVAL": 30,
@@ -57,7 +61,9 @@
         ]
       }
     },
-    "FEATURE_REDETECT_THRESHOLD": 105
+    "FEATURE_REDETECT_THRESHOLD": 20,
+    "FEATURE_QUALITY_WEIGHTING_ENABLED": true,
+    "FEATURE_MIN_QUALITY_SCORE": 0.0001
   },
   "signal_generator": {
     "SIGNAL_MIN_FEATURES_FOR_PCA": 3,

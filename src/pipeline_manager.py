@@ -113,46 +113,81 @@ class PipelineManager:
         # --- 2. Feature Tracking ---
         tracked_data = []
         current_tracked_points = None # Store the points tracked in *this* frame
+        old_tracked_points_for_signal = None # Store old points for signal generation
+        feature_weights_from_tracker = None # To store weights from feature tracker
+        status_from_tracker = None      # To store status from feature tracker
         try:
             t_start_ft = time.perf_counter()
             tracked_data = self.feature_tracker.process_frame(image_gray, self.current_rois)
             t_end_ft = time.perf_counter()
             # --- Extract points tracked in this frame for returning ---
-            if tracked_data and tracked_data[0] is not None:
-                 # tracked_data is list of tuples: [(old0, new0), ...]
-                 # Get the new points from the first ROI's tuple
-                 _, new_points = tracked_data[0]
-                 if new_points is not None:
-                      current_tracked_points = new_points # Store for results dict
+            # Assuming tracked_data is a list like [(status, old_points, new_points, feature_weights), ...]
+            # We'll process the first item, assuming single ROI focus for this part.
+            if tracked_data and tracked_data[0] is not None: # Check if tracker returned data for the first ROI
+                 # --- MODIFIED: Make print less verbose ---
+                 status_dbg, old_pts_dbg, new_pts_dbg, weights_dbg = tracked_data[0]
+                 old_shape_dbg = old_pts_dbg.shape if hasattr(old_pts_dbg, 'shape') else 'None'
+                 new_shape_dbg = new_pts_dbg.shape if hasattr(new_pts_dbg, 'shape') else 'None'
+                 weights_shape_dbg = weights_dbg.shape if hasattr(weights_dbg, 'shape') else 'None'
+                 print(f"[PipelineManager Debug] Feature tracker returned: status='{status_dbg}', "
+                       f"old_pts_shape={old_shape_dbg}, new_pts_shape={new_shape_dbg}, "
+                       f"weights_shape={weights_shape_dbg}")
+                 # --- END MODIFICATION ---
+                 # Unpack status, old points, new points, and feature weights
+                 status_from_tracker, temp_old_points, temp_new_points, feature_weights_from_tracker = tracked_data[0]
+                 if temp_new_points is not None:
+                      current_tracked_points = temp_new_points # These are the points for results['tracked_points']
+                 if temp_old_points is not None:
+                      old_tracked_points_for_signal = temp_old_points
+            else:
+                print(f"[PipelineManager Debug] Feature tracker did NOT return valid data for ROI 0. tracked_data: {tracked_data}")
             # ---
             t_feature_tracker = (t_end_ft - t_start_ft) * 1000 # Duration in ms
         except Exception as e_track:
              print(f"[PipelineManager] Error during feature tracking: {e_track}"); traceback.print_exc()
-             tracked_data = [(None, None)] * len(self.current_rois)
+             # Adjust default if feature_tracker is expected to return 3 items per ROI
+             tracked_data = [(None, None, None, None)] * len(self.current_rois) # Now 4 items
 
         # --- 3. Signal Generation ---
-        raw_signals = []
-        raw_signal_for_recording = None # Initialize variable to store raw signal
-        # Check if tracked_data is valid before proceeding
-        if tracked_data and tracked_data[0] is not None: # Check if tracking produced data
+        raw_signal_value = None # Will store the single raw signal value
+        tracked_points_for_signal_gen = None # Points actually used by signal generator
+
+        # Check if we have points and weights from the feature tracker
+        print(f"[PipelineManager Debug] Before signal gen: old_points is None? {old_tracked_points_for_signal is None}, new_points (current_tracked_points) is None? {current_tracked_points is None}, feature_weights is None? {feature_weights_from_tracker is None}")
+        if old_tracked_points_for_signal is not None and current_tracked_points is not None: # Weights can be None
+            print(f"[PipelineManager Debug] Attempting signal generation with old_points_shape {old_tracked_points_for_signal.shape if hasattr(old_tracked_points_for_signal, 'shape') else 'N/A'}, new_points_shape {current_tracked_points.shape if hasattr(current_tracked_points, 'shape') else 'N/A'}, and weights_shape {feature_weights_from_tracker.shape if hasattr(feature_weights_from_tracker, 'shape') else 'N/A'}.")
             try:
                 t_start_sg = time.perf_counter()
-                # Assuming process_tracked_features is the correct method in the reverted version
-                raw_signals = self.signal_generator.process_tracked_features(tracked_data)
-                # --- Invert the raw signal(s) ---
-                if raw_signals: # Check if list is not empty
-                    raw_signals = [-s for s in raw_signals] # Multiply each element by -1
-                    # Store the first raw signal (assuming single ROI for now) for recording
-                    raw_signal_for_recording = raw_signals[0] if raw_signals else None
+                # Call the SignalGenerator method that accepts points, ROI, and weights.
+                # Assuming generate_signal is the target method and it handles one ROI's data.
+                # It should return the raw signal value and the points it effectively used.
+                current_roi_for_signal = self.current_rois[0] if self.current_rois else None
+                
+                raw_signal_value, tracked_points_for_signal_gen = self.signal_generator.generate_signal(
+                    old_tracked_points_for_signal, # Pass old points
+                    current_tracked_points,
+                    current_roi_for_signal,
+                    feature_weights_from_tracker
+                )
+                print(f"[PipelineManager Debug] Signal generator returned: raw_signal_value={raw_signal_value}, tracked_points_for_signal_gen exists? {tracked_points_for_signal_gen is not None}")
+
+                # --- Invert the raw signal ---
+                if raw_signal_value is not None:
+                    raw_signal_value = -raw_signal_value # Invert the single signal value
+                    print(f"[PipelineManager Debug] Inverted raw_signal_value: {raw_signal_value}")
+
                 t_end_sg = time.perf_counter()
                 t_signal_gen = (t_end_sg - t_start_sg) * 1000 # Duration in ms
-            except Exception as e_siggen: print(f"[PipelineManager] Error during signal generation: {e_siggen}"); traceback.print_exc(); raw_signals = [0.0] * len(tracked_data)
+            except Exception as e_siggen: print(f"[PipelineManager] Error during signal generation: {e_siggen}"); traceback.print_exc(); raw_signal_value = None; print("[PipelineManager Debug] raw_signal_value set to None due to exception in signal_generator.")
+        else:
+            print("[PipelineManager Debug] Skipped signal generation because old_tracked_points_for_signal or current_tracked_points was None.")
 
         # --- 4. Signal Processing ---
+        # SignalProcessor expects a list of raw signal values.
+        raw_signals_for_processor = [raw_signal_value] if raw_signal_value is not None else []
         try:
             t_start_sp = time.perf_counter()
-            # Assuming process_signal_values is the correct method in the reverted version
-            self.signal_processor.process_signal_values(raw_signals)
+            self.signal_processor.process_signal_values(raw_signals_for_processor)
             t_end_sp = time.perf_counter()
             t_signal_proc = (t_end_sp - t_start_sp) * 1000 # Duration in ms
         except Exception as e_sigproc: print(f"[PipelineManager] Error during signal processing: {e_sigproc}"); traceback.print_exc()
@@ -188,8 +223,11 @@ class PipelineManager:
             },
             'recalibration_run_this_frame': False, 'recalibration_succeeded': False,
             'frame_count': self.frame_count,
-            'tracked_points': current_tracked_points, # Tracked points (already present)
-            'raw_signal': raw_signal_for_recording    # <<< ADDED raw signal
+            'tracked_points': current_tracked_points,    # Points from feature tracker
+            'raw_signal': raw_signal_value,              # The (potentially inverted) raw signal value
+            'feature_tracker_status': status_from_tracker, # Status from feature tracker
+            'feature_weights': feature_weights_from_tracker, # Weights from feature tracker
+            'tracked_points_for_signal': tracked_points_for_signal_gen # Points used by signal_generator
         }
         return results
 

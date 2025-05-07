@@ -371,9 +371,10 @@ class PipelineWorker(QObject):
     # --- Recorder Process Management ---
     def _start_recorder_process(self):
         """Starts the DataRecorder in a separate process."""
+        # print("[Worker Debug] _start_recorder_process: Recorder already running, skipping.")
         if self.recorder_process and self.recorder_process.is_alive():
             print("[Worker] Recorder process already running.")
-            print("[Worker Debug] Recorder already running, skipping start.") # DEBUG
+            # print("[Worker Debug] Recorder already running, skipping start.") # DEBUG
             return
 
         try:
@@ -392,13 +393,14 @@ class PipelineWorker(QObject):
             )
 
             # Start the process, targeting the recorder's run method
+            # print("[Worker Debug] _start_recorder_process: About to start DataRecorder process.")
             self.recorder_process = mp_proc.Process(target=recorder_instance.run, daemon=True)
             self.recorder_process.start()
-            print("[Worker Debug] Recorder process initiated.") # DEBUG
+            # print("[Worker Debug] Recorder process initiated.") # DEBUG
             print(f"[Worker] Recorder process started (PID: {self.recorder_process.pid}). Saving to {run_dir_name}")
         except Exception as e:
             print(f"[Worker] Failed to start recorder process: {e}")
-            print("[Worker Debug] Exception during recorder start.") # DEBUG
+            # print("[Worker Debug] Exception during recorder start.") # DEBUG
             traceback.print_exc()
     # --- NEW SLOT TO HANDLE SAVE REQUESTS ---
     @pyqtSlot(str)
@@ -450,9 +452,9 @@ class PipelineWorker(QObject):
         # --- IMMEDIATE CHECK: Exit if stop has been requested ---
         if not self._running:
             # Ensure timer is stopped if this is reached unexpectedly
-            if self.run_timer.isActive():
-                print("[Worker Run Debug] Stopping timer from top check.")
-                self.run_timer.stop() # Stop timer if active
+            # if self.run_timer.isActive(): # This check might be redundant if stop() handles it
+                # print("[Worker Run Debug] Stopping timer from top check.")
+            self.run_timer.stop() # Stop timer if active
             self._cleanup_resources() # Perform cleanup
             self.finished.emit()
             return
@@ -534,7 +536,7 @@ class PipelineWorker(QObject):
                 # --- Emit preview results ---
                 # --- Expanded Timing Calculation for Preview ---
                 t_cycle_end = time.perf_counter()
-                # t_worker_cycle_ms = (t_cycle_end - t_cycle_start) * 1000
+                t_worker_cycle_ms = (t_cycle_end - t_cycle_start) * 1000
                 # print(f"[Timing Preview (ms)] Grab: {t_frame_grab_ms:.1f}, "
                 #       f"Pose/ROI: {t_preview_overhead_ms:.1f}, "
                 #       f"Draw: {t_draw_overlays_ms:.1f}, "
@@ -567,20 +569,40 @@ class PipelineWorker(QObject):
                 results = self.pipeline_manager.process_frame(frame)
 
                 # --- Send Data to Recorder (if enabled) ---
-                if self.recording_enabled and self.recorder_queue is not None and results:
+                # --- Add more detailed debug for recorder data sending ---
+                can_send_to_recorder = self.recording_enabled and self.recorder_queue is not None and results is not None
+                # print(f"[Worker Debug Rec] Pre-send check: recording_enabled={self.recording_enabled}, recorder_queue_exists={self.recorder_queue is not None}, results_exist={results is not None}")
+
+                if can_send_to_recorder:
+                    raw_signal_from_results = results.get('raw_signal')
+                    tracked_points_from_results = results.get('tracked_points')
+
+                    # --- NEW DETAILED DEBUG ---
+                    print(f"[Worker Debug Rec Data] Check before queueing: "
+                          f"recording_enabled={self.recording_enabled}, "
+                          f"recorder_queue_valid={self.recorder_queue is not None}, "
+                          f"results_valid={results is not None}, "
+                          f"raw_signal_valid={raw_signal_from_results is not None}, "
+                          f"tracked_points_valid={tracked_points_from_results is not None}")
+                    if raw_signal_from_results is not None:
+                        print(f"[Worker Debug Rec Data] raw_signal_value_to_queue={raw_signal_from_results:.4f}")
+                    if tracked_points_from_results is not None:
+                        print(f"[Worker Debug Rec Data] tracked_points_to_queue_shape={tracked_points_from_results.shape if hasattr(tracked_points_from_results, 'shape') else 'N/A'}")
+                    # --- END NEW DETAILED DEBUG ---
+
                     try:
                         # *** IMPORTANT: Ensure these keys exist in your 'results' dict ***
-                        raw_signal = results.get('raw_signal') # Get the *unfiltered* signal
-                        # --- UNCOMMENT TO DEBUG ---
-                        print(f"[Worker Debug] Results keys: {results.keys() if results else 'None'}")
-                        # --- END DEBUG PRINT ---
-                        tracked_points = results.get('tracked_points') # Get the coords used for signal
+                        # --- COMMENTED OUT DEBUG PRINT ---
+                        # print(f"[Worker Debug] Results keys: {results.keys() if results else 'None'}")
 
-                        if raw_signal is not None and tracked_points is not None:
+                        if raw_signal_from_results is not None and tracked_points_from_results is not None:
                             timestamp = time.time()
                             # Put data onto the queue for the recorder process
-                            print(f"[Worker Debug] Putting data onto recorder queue: ts={timestamp:.2f}, signal={raw_signal:.4f}, points_shape={tracked_points.shape if hasattr(tracked_points, 'shape') else 'N/A'}") # DEBUG
-                            self.recorder_queue.put_nowait((timestamp, raw_signal, tracked_points))
+                            # This is the key debug print for successful queuing attempt:
+                            # print(f"[Worker Debug] Putting data onto recorder queue: ts={timestamp:.2f}, signal={raw_signal_from_results:.4f}, points_shape={tracked_points_from_results.shape if hasattr(tracked_points_from_results, 'shape') else 'N/A'}") # DEBUG
+                            self.recorder_queue.put_nowait((timestamp, raw_signal_from_results, tracked_points_from_results))
+                        else:
+                            print(f"[Worker Debug Rec Skip] Did NOT queue data: raw_signal_from_results is None ({raw_signal_from_results is None}) or tracked_points_from_results is None ({tracked_points_from_results is None}).")
                     except mp_proc.queues.Full:
                         print("[Worker] Warning: Recorder queue is full. Data point dropped.")
 
@@ -632,16 +654,16 @@ class PipelineWorker(QObject):
                 self.new_frame_ready.emit(processed_frame)
                 if results:
                     # --- ADD PRINT STATEMENT FOR TIMING ---
-                    if 'timing_ms' in results:
-                        pipeline_timings = results['timing_ms']
-                        # Print expanded timings
-                        # print(f"[Timing (ms)] Grab: {t_frame_grab_ms:.1f}, "
-                        #       f"FT: {pipeline_timings.get('feature_tracker', 0):.1f}, "
-                        #       f"SG: {pipeline_timings.get('signal_generator', 0):.1f}, "
-                        #       f"SP: {pipeline_timings.get('signal_processor', 0):.1f}, "
-                        #       f"Draw: {t_draw_overlays_ms:.1f}, "
-                        #       f"PipeTotal: {pipeline_timings.get('total_pipeline', 0):.1f}, "
-                        #       f"CycleTotal: {t_worker_cycle_ms:.1f}")
+                    # if 'timing_ms' in results:
+                    #     pipeline_timings = results['timing_ms'] # type: ignore
+                    #     # Print expanded timings
+                    #     print(f"[Timing (ms)] Grab: {t_frame_grab_ms:.1f}, "
+                    #           f"FT: {pipeline_timings.get('feature_tracker', 0):.1f}, "
+                    #           f"SG: {pipeline_timings.get('signal_generator', 0):.1f}, "
+                    #           f"SP: {pipeline_timings.get('signal_processor', 0):.1f}, "
+                    #           f"Draw: {t_draw_overlays_ms:.1f}, "
+                    #           f"PipeTotal: {pipeline_timings.get('total_pipeline', 0):.1f}, "
+                    #           f"CycleTotal: {t_worker_cycle_ms:.1f}")
                     # --- END PRINT STATEMENT ---
 
                     # --- Emit latest filtered value for visualizer ---
@@ -706,7 +728,7 @@ class PipelineWorker(QObject):
     def _stop_recorder_process(self):
         """Signals the recorder process to stop and waits for it."""
         if self.recorder_process and self.recorder_process.is_alive():
-            print("[Worker Debug] Attempting to stop recorder process...") # DEBUG
+            # print("[Worker Debug] Attempting to stop recorder process...") # DEBUG
             print("[Worker] Stopping recorder process...")
             if self.recorder_stop_event:
                 self.recorder_stop_event.set() # Signal the recorder loop to exit
@@ -716,7 +738,7 @@ class PipelineWorker(QObject):
             if self.recorder_process.is_alive():
                 print("[Worker] Recorder process did not exit gracefully, terminating.")
                 self.recorder_process.terminate() # Force terminate if needed
-            print("[Worker Debug] Recorder process stop sequence complete.") # DEBUG
+            # print("[Worker Debug] Recorder process stop sequence complete.") # DEBUG
             print("[Worker] Recorder process stopped.")
         self.recorder_process = None
         self.recorder_queue = None
@@ -724,19 +746,19 @@ class PipelineWorker(QObject):
 
     def stop(self):
         """Requests the worker loop to stop."""
-        # This method is called via QueuedConnection from app.aboutToQuit,
-        # so it executes in the worker thread.
+        # This method is called via QueuedConnection from app.aboutToQuit or directly
+        # if the worker thread is stopping itself.
         print("[Worker] stop() method executing in worker thread.")
         self._running = False # Signal the run loop to stop processing on its next check
-        # Since we are in the worker thread, we can safely stop the timer directly here.
+        # Since we are (likely) in the worker thread, we can safely stop the timer directly here.
         if self.run_timer.isActive():
-            print("[Worker Debug] Stopping timer directly within stop().")
+            # print("[Worker Debug] Stopping timer directly within stop().")
             self.run_timer.stop()
 
         # Removed QApplication.processEvents(), _cleanup_resources(), and finished.emit()
         # Rely on the run() method's check for self._running == False to trigger
         # the final cleanup and finished signal emission.
-        print("[Worker Debug] stop() method finished setting flag and stopping timer.")
+        # print("[Worker Debug] stop() method finished setting flag and stopping timer.")
 
     def set_tracking_active(self, active: bool):
         """Slot to start or stop the tracking state."""
@@ -816,8 +838,9 @@ class PipelineWorker(QObject):
     # --- ADDED: Method to handle delayed recorder start ---
     def _delayed_start_recorder(self):
         """Starts the recorder process if still in TRACKING state."""
+        # print(f"[Worker Debug] _delayed_start_recorder called. State: {self.state}, Running: {self._running}, RecEnabled: {self.recording_enabled}")
         if self._running and self.state == WorkerState.TRACKING and self.recording_enabled:
-            print("[Worker Debug] Conditions met for delayed recorder start.") # DEBUG
+            # print("[Worker Debug] Conditions met for delayed recorder start.") # DEBUG
             print("[Worker] 3-second delay complete. Starting recorder now.")
             self._start_recorder_process()
 

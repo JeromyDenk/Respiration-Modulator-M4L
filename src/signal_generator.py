@@ -78,159 +78,166 @@ class SignalGenerator:
             traceback.print_exc()
             return 0.0, "Exception in PCA"
 
-    def process_tracked_features(self, tracked_data_all_rois):
+    def _weighted_median(self, data, weights):
         """
-        Calculates raw motion signals from tracked feature points for multiple ROIs
+        Helper function to compute the weighted median.
+        Assumes data and weights are 1D NumPy arrays of the same length.
+        """
+        if data is None or weights is None or len(data) == 0 or len(weights) == 0:
+            return 0.0
+        if len(data) != len(weights):
+            print("[SignalGenerator] Warning: Data and weights length mismatch for weighted median. Returning unweighted median.")
+            return np.median(data)
+
+        sorted_indices = np.argsort(data)
+        data_sorted = data[sorted_indices]
+        weights_sorted = weights[sorted_indices]
+        cumulative_weights = np.cumsum(weights_sorted)
+        total_weight = cumulative_weights[-1]
+
+        if total_weight <= 1e-9: # Avoid division by zero if all weights are zero
+            return np.median(data) # Fallback to unweighted median
+
+        median_weight_mark = total_weight / 2.0
+        median_index = np.where(cumulative_weights >= median_weight_mark)[0]
+
+        if len(median_index) == 0: # Should not happen if total_weight > 0
+            return np.median(data)
+
+        return data_sorted[median_index[0]]
+
+    def generate_signal(self, old_points, new_points, roi_definition, weights):
+        """
+        Calculates a raw motion signal from tracked feature points for a single ROI
         using the configured aggregation method (mean or median) on vertical displacement.
 
         Args:
-            tracked_data_all_rois (list): A list where each element is a tuple
-                (good_old_points, good_new_points, qualities) from FeatureTracker.
-                Points are NumPy arrays of shape (N, 2) or (N, 1, 2).
-                Qualities is a NumPy array of shape (N,) or None.
+            old_points (np.ndarray): Previous locations of tracked features (N, 2) or (N, 1, 2).
+            new_points (np.ndarray): Current locations of tracked features (N, 2) or (N, 1, 2).
+            roi_definition (tuple or None): The (x, y, w, h) of the ROI, for context or future use.
+            weights (np.ndarray or None): Quality scores/weights for the new_points (N,).
 
         Returns:
-            list: A list of raw motion signal float values, one for each ROI processed.
-                  Returns 0.0 for ROIs where calculation was not possible.
+            tuple: (float, np.ndarray or None)
+                   - The raw motion signal value (float).
+                   - The new_points that were effectively used for signal generation (or None).
         """
-        raw_signals = []
-        # processing_summary = [] # Use for less noisy debug output if needed
+        signal_value = 0.0  # Default signal
+        points_used_for_signal = None # Default
+        reason = "Input None/Empty"  # Default reason
 
-        for i, tracked_data in enumerate(tracked_data_all_rois):
-            # --- Unpack data, including qualities ---
-            old_points, new_points, qualities = tracked_data # Unpack 3 elements            
-            signal_value = 0.0 # Default signal
-            reason = "Input None/Empty" # Default reason for zero signal
+        if old_points is None or new_points is None or \
+           len(old_points) == 0 or len(old_points) != len(new_points):
+            # print(f"[SignalGenerator] Invalid input points: old_none={old_points is None}, new_none={new_points is None}, len_old={len(old_points) if old_points is not None else 'N/A'}")
+            return signal_value, points_used_for_signal
 
-            # Check if we have valid data for this ROI
-            if old_points is not None and new_points is not None and \
-               len(old_points) > 0 and len(old_points) == len(new_points):
+        # Ensure points are in (N, 2) format
+        if old_points.ndim == 3 and old_points.shape[1] == 1:
+            old_points = old_points.reshape(-1, 2)
+        if new_points.ndim == 3 and new_points.shape[1] == 1:
+            new_points = new_points.reshape(-1, 2)
 
-                # Ensure points are in (N, 2) format
-                if old_points.ndim == 3 and old_points.shape[1] == 1:
-                    old_points = old_points.reshape(-1, 2)
-                if new_points.ndim == 3 and new_points.shape[1] == 1:
-                    new_points = new_points.reshape(-1, 2)
+        if old_points.shape[1] != 2 or new_points.shape[1] != 2:
+            reason = "Invalid point shape after reshape"
+            # print(f"[SignalGenerator] {reason}: old_shape={old_points.shape}, new_shape={new_points.shape}")
+            return signal_value, points_used_for_signal
 
-                # Check shape again after potential reshape
-                if old_points.shape[1] == 2 and new_points.shape[1] == 2:
-                    num_points = old_points.shape[0]
-                    # Use the potentially renamed config key here
-                    if num_points >= self.min_features_for_signal:
-                        try:
-                            # Calculate displacement vectors (dx, dy)
-                            displacements = new_points - old_points # Shape (N, 2)
+        num_points = old_points.shape[0]
+        if num_points < self.min_features_for_signal:
+            reason = f"Too few points ({num_points}/{self.min_features_for_signal})"
+            # print(f"[SignalGenerator] {reason}")
+            return signal_value, points_used_for_signal # Return new_points as points_used, even if signal is 0
 
-                            # Calculate vertical displacements (dy)
-                            vertical_displacements = displacements[:, 1] # Select only the y-component (index 1)
+        try:
+            displacements = new_points - old_points
+            vertical_displacements = displacements[:, 1]
 
-                            # --- Apply IQR Filter if enabled ---
-                            filtered_displacements = vertical_displacements # Start with original
-                            filtered_qualities = qualities # Start with original qualities
-                            num_original = len(filtered_displacements)
-                            num_filtered = num_original # Initialize in case filter doesn't run
-                            if self.iqr_filter_enabled and num_original >= 4: # Need at least 4 points for quartiles
-                                try:
-                                    q1, q3 = np.percentile(filtered_displacements, [25, 75])
-                                    iqr = q3 - q1
-                                    # Only filter if IQR is positive to avoid issues with constant data
-                                    if iqr > 1e-9: # Use a small epsilon
-                                        lower_bound = q1 - self.iqr_k_factor * iqr
-                                        upper_bound = q3 + self.iqr_k_factor * iqr
-                                        mask = (filtered_displacements >= lower_bound) & (filtered_displacements <= upper_bound)
-                                        filtered_displacements = filtered_displacements[mask]
-                                        # --- Filter qualities using the same mask ---
-                                        if filtered_qualities is not None:
-                                            filtered_qualities = filtered_qualities[mask]
-                                        num_filtered = len(filtered_displacements)
-                                        # --- Add More Debugging ---
-                                        if num_filtered < num_original:
-                                             print(f"[IQR Debug Frame {i}] Filtered {num_original - num_filtered} outliers ({num_original} -> {num_filtered}). IQR={iqr:.3f}, Bounds=[{lower_bound:.3f}, {upper_bound:.3f}]")
-                                        elif num_filtered == 0:
-                                             print(f"[IQR Debug Frame {i}] Filtered ALL points ({num_original} -> 0). IQR={iqr:.3f}, Bounds=[{lower_bound:.3f}, {upper_bound:.3f}]")
-                                    # else: # Optional: Print if IQR was too small to filter
-                                    #     print(f"[IQR Debug Frame {i}] IQR <= 1e-9 ({iqr:.3f}), not filtering.")
+            filtered_displacements = vertical_displacements
+            filtered_qualities = weights # Use the passed 'weights' as 'qualities'
+            num_original = len(filtered_displacements)
+            num_filtered = num_original
 
-                                except Exception as e_iqr:
-                                    print(f"[SignalGenerator] Warning: IQR filter failed for ROI {i}: {e_iqr}")
-                                    # Fallback to original displacements on error
-                                    filtered_qualities = qualities # Also fallback qualities
-                                    filtered_displacements = vertical_displacements
-                                    num_filtered = len(filtered_displacements) # Update count
+            if self.iqr_filter_enabled and num_original >= 4:
+                try:
+                    q1, q3 = np.percentile(filtered_displacements, [25, 75])
+                    iqr = q3 - q1
+                    if iqr > 1e-9:
+                        lower_bound = q1 - self.iqr_k_factor * iqr
+                        upper_bound = q3 + self.iqr_k_factor * iqr
+                        mask = (filtered_displacements >= lower_bound) & (filtered_displacements <= upper_bound)
+                        filtered_displacements = filtered_displacements[mask]
+                        if filtered_qualities is not None:
+                            filtered_qualities = filtered_qualities[mask]
+                        num_filtered = len(filtered_displacements)
+                        # if num_filtered < num_original:
+                        #     print(f"[IQR Debug] Filtered {num_original - num_filtered} outliers ({num_original} -> {num_filtered}).")
+                except Exception as e_iqr:
+                    print(f"[SignalGenerator] Warning: IQR filter failed: {e_iqr}")
+                    filtered_qualities = weights
+                    filtered_displacements = vertical_displacements
+                    num_filtered = len(filtered_displacements)
 
-                            # --- Aggregation happens *after* potential filtering ---
-                            # Check if any points remain *after* filtering
-                            if num_filtered > 0:
-                            # --- Check if quality weights are available and valid ---
-                                # Check if qualities were provided, are a numpy array, and match the filtered length
-                                use_weights = isinstance(filtered_qualities, np.ndarray) and len(filtered_qualities) == num_filtered
+            if num_filtered > 0:
+                points_used_for_signal = new_points # Or a subset if points themselves were filtered by IQR mask
+                                                  # For now, assume new_points corresponding to filtered_displacements
+                                                  # This needs careful handling if points are filtered.
+                                                  # Let's simplify and return all new_points if any signal is generated.
+                if num_filtered < num_original and self.iqr_filter_enabled: # If IQR actually filtered points
+                    # We need to select the new_points that correspond to the filtered_displacements
+                    # This requires the 'mask' from IQR to be applied to new_points as well.
+                    # For simplicity, if IQR filters, we might just return all new_points for now,
+                    # or None if this detail is critical for downstream.
+                    # Let's assume for now that PipelineManager uses the 'raw_signal' and 'tracked_points' (all new_points)
+                    # separately, and the signal value itself reflects the filtering.
+                    pass # Mask would have been applied to filtered_displacements and filtered_qualities
 
-                                if use_weights:
-                                    # --- Clip and Normalize Weights ---
-                                    # Ensure non-negative (should be from Shi-Tomasi)
-                                    clipped_weights = np.maximum(0, filtered_qualities)
-                                    # Clip extreme high values (e.g., at 95th percentile)
-                                    if num_filtered > 1: # Percentile needs > 1 point
-                                        p95 = np.percentile(clipped_weights, 95)
-                                        clipped_weights = np.minimum(clipped_weights, p95)
+                use_weights = isinstance(filtered_qualities, np.ndarray) and len(filtered_qualities) == num_filtered
 
-                                    if self.aggregation_method == 'mean':
-                                        # Normalize weights to sum to 1 for weighted average
-                                        weight_sum = np.sum(clipped_weights)
-                                        if weight_sum > 1e-9:
-                                            norm_weights = clipped_weights / weight_sum
-                                            signal_value = np.sum(filtered_displacements * norm_weights)
-                                            reason = f"Weighted Mean ({num_filtered}/{num_original} pts)"
-                                        else: # Handle case where all weights are near zero
-                                            signal_value = np.mean(filtered_displacements) # Fallback to unweighted mean
-                                            reason = f"Mean (weights near zero) ({num_filtered}/{num_original} pts)"
-                                    else: # Weighted Median (assuming _weighted_median helper exists)
-                                        signal_value = self._weighted_median(filtered_displacements, clipped_weights) # Use clipped, non-normalized weights
-                                        reason = f"Weighted Median ({num_filtered}/{num_original} pts)"
-                                else: # No valid weights, use standard aggregation
-                                    if self.aggregation_method == 'mean':
-                                        signal_value = np.mean(filtered_displacements)
-                                        reason = f"Mean ({num_filtered}/{num_original} pts, no weights)"
-                                    else: # Default/Median
-                                        signal_value = np.median(filtered_displacements)
-                                        reason = f"Median ({num_filtered}/{num_original} pts, no weights)"
-                            else:
-                                signal_value = 0.0 # No points left after filtering
-                                reason = f"No points left after IQR filter ({num_original} -> 0)"
+                if use_weights:
+                    clipped_weights = np.maximum(0, filtered_qualities)
+                    if num_filtered > 1:
+                        p95 = np.percentile(clipped_weights, 95)
+                        clipped_weights = np.minimum(clipped_weights, p95)
 
-                            # Handle potential NaN if filtering removed all points or input was NaN
-                            if np.isnan(signal_value):
-                                signal_value = 0.0
-                                reason += " (NaN result -> 0.0)"
+                    if self.aggregation_method == 'mean':
+                        weight_sum = np.sum(clipped_weights)
+                        if weight_sum > 1e-9:
+                            norm_weights = clipped_weights / weight_sum
+                            signal_value = np.sum(filtered_displacements * norm_weights)
+                            reason = f"Weighted Mean ({num_filtered}/{num_original} pts)"
+                        else:
+                            signal_value = np.mean(filtered_displacements)
+                            reason = f"Mean (weights near zero) ({num_filtered}/{num_original} pts)"
+                    else: # Median
+                        signal_value = self._weighted_median(filtered_displacements, clipped_weights)
+                        reason = f"Weighted Median ({num_filtered}/{num_original} pts)"
+                else: # No valid weights
+                    if self.aggregation_method == 'mean':
+                        signal_value = np.mean(filtered_displacements)
+                        reason = f"Mean ({num_filtered}/{num_original} pts, no weights)"
+                    else: # Median
+                        signal_value = np.median(filtered_displacements)
+                        reason = f"Median ({num_filtered}/{num_original} pts, no weights)"
+            else:
+                reason = f"No points left after IQR filter ({num_original} -> 0)"
 
+            if np.isnan(signal_value):
+                signal_value = 0.0
+                reason += " (NaN result -> 0.0)"
+            
+            points_used_for_signal = new_points # Return all new_points if signal calculation was attempted
 
-                        except Exception as e_calc:
-                             print(f"[SignalGenerator] Error during {self.aggregation_method.capitalize()} Vertical Displacement calc for ROI {i}: {e_calc}")
-                             traceback.print_exc()
-                             signal_value = 0.0
-                             reason = f"Exception in {self.aggregation_method.capitalize()} Vert Disp"
+        except Exception as e_calc:
+            print(f"[SignalGenerator] Error during {self.aggregation_method.capitalize()} Vertical Disp calc: {e_calc}")
+            traceback.print_exc()
+            signal_value = 0.0
+            reason = f"Exception in {self.aggregation_method.capitalize()} Vert Disp"
 
-                    else: # Handle cases where points exist but not enough for calculation
-                        reason = f"Too few points ({num_points}/{self.min_features_for_signal})"
-                else: # Handle case where reshape failed or shape is wrong
-                     reason = "Invalid point shape"
-            # else: Handled by default reason "Input None/Empty"
+        # if signal_value == 0.0 and reason not in ["Input None/Empty", f"Too few points ({num_points}/{self.min_features_for_signal})"]:
+        #      print(f"[SignalGenerator Debug] Signal=0.0, Reason='{reason}'")
 
-            # --- More Verbose Debugging ---
-            if signal_value == 0.0 and reason != "Input None/Empty":
-                 print(f"[SignalGenerator Frame Debug] ROI{i}: Signal=0.0, Reason='{reason}'")
-            # elif np.random.rand() < 0.02:
-            #      print(f"[SignalGenerator Frame Debug] ROI{i}: Signal={signal_value:.4f}, Reason='{reason}'")
-            # --- End Debugging ---
+        return signal_value, points_used_for_signal
 
-            raw_signals.append(signal_value)
-            # processing_summary.append(f"ROI{i}:{signal_value:.3f}({reason})")
-
-        # Optional: Print summary less frequently
-        # if np.random.rand() < 0.05:
-        #    print(f"[SignalGenerator] Debug Summary: {', '.join(processing_summary)}")
-
-        return raw_signals
 
 # Example usage (for testing this module directly)
 # NOTE: Assertions updated for the MEDIAN calculation (default)
@@ -281,23 +288,22 @@ if __name__ == '__main__':
     new8 = np.array([[10, 11], [20, 23], [30, 36]], dtype=np.float32) # dy = [1, 3, 6]
     qual8 = np.array([10.0, 1.0, 1.0], dtype=np.float32) # High weight on first point (dy=1)
 
-    tracked_data_list = [
-        (old1, new1, None), (old2, new2, None), (old3, new3, None),
-        (old4, new4, None), (old5, new5, None), (old6, new6, None),
-        (old7, new7, None), # IQR test (no weights needed)
-        (old8, new8, qual8) # Weighted test
-
+    tracked_data_list_tuples = [ # Simulating the old input format for testing the new method
+        (old1, new1, None, "ROI1"), (old2, new2, None, "ROI2"), (old3, new3, None, "ROI3"),
+        (old4, new4, None, "ROI4"), (old5, new5, None, "ROI5"), (old6, new6, None, "ROI6"),
+        (old7, new7, None, "ROI7"), 
+        (old8, new8, qual8, "ROI8") 
     ]
 
     # --- Test Processing (Median) ---
     print("\n--- Processing Mock Data (Median Aggregation) ---")
-    signals_median = generator_median.process_tracked_features(tracked_data_list)
+    signals_median = [generator_median.generate_signal(o, n, roi_def, q)[0] for o, n, q, roi_def in tracked_data_list_tuples]
     print(f"Calculated Signals (Median): {signals_median}")
     # Expected Median: [2.0, 0.0, 0.0 (too few points), 0.0, 0.0, 2.0]
 
     # --- Basic Assertions (Median) ---
     print("\n--- Running Assertions (Median) ---")
-    assert len(signals_median) == len(tracked_data_list), "Median: Number of signals should match number of ROIs"
+    assert len(signals_median) == len(tracked_data_list_tuples), "Median: Number of signals should match number of ROIs"
     assert np.isclose(signals_median[0], 2.0), f"Median ROI 1 expected ~2.0, got {signals_median[0]}"
     assert np.isclose(signals_median[1], 0.0), f"Median ROI 2 expected ~0.0, got {signals_median[1]}" # Median is 0.0
     assert signals_median[2] == 0.0, "Median ROI 3 (not enough points) should produce zero signal"
@@ -308,13 +314,13 @@ if __name__ == '__main__':
 
     # --- Test Processing (Mean) ---
     print("\n--- Processing Mock Data (Mean Aggregation) ---")
-    signals_mean = generator_mean.process_tracked_features(tracked_data_list)
+    signals_mean = [generator_mean.generate_signal(o, n, roi_def, q)[0] for o, n, q, roi_def in tracked_data_list_tuples]
     print(f"Calculated Signals (Mean): {signals_mean}")
     # Expected Mean: [2.0, 0.16, 0.0 (too few points), 0.0, 0.0, 2.0]
 
     # --- Basic Assertions (Mean) ---
     print("\n--- Running Assertions (Mean) ---")
-    assert len(signals_mean) == len(tracked_data_list), "Mean: Number of signals should match number of ROIs"
+    assert len(signals_mean) == len(tracked_data_list_tuples), "Mean: Number of signals should match number of ROIs"
     assert np.isclose(signals_mean[0], 2.0), f"Mean ROI 1 expected ~2.0, got {signals_mean[0]}"
     assert np.isclose(signals_mean[1], 0.16), f"Mean ROI 2 expected ~0.16, got {signals_mean[1]}" # Mean is 0.16
     assert signals_mean[2] == 0.0, "Mean ROI 3 (not enough points) should produce zero signal"
@@ -326,7 +332,7 @@ if __name__ == '__main__':
     # --- Test Processing (Median with IQR) ---
     print("\n--- Processing Mock Data (Median Aggregation with IQR Filter) ---")
     generator_median_iqr = SignalGenerator(config=mock_config_median_iqr)
-    signals_median_iqr = generator_median_iqr.process_tracked_features(tracked_data_list)
+    signals_median_iqr = [generator_median_iqr.generate_signal(o, n, roi_def, q)[0] for o, n, q, roi_def in tracked_data_list_tuples]
     print(f"Calculated Signals (Median w/ IQR): {signals_median_iqr}")
     # Expected Median w/ IQR: [2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.0 (outliers 5, 5 removed)]
     print("\n--- Running Assertions (Median w/ IQR) ---")
@@ -336,7 +342,7 @@ if __name__ == '__main__':
     # --- Test Processing (Weighted Mean) ---
     print("\n--- Processing Mock Data (Weighted Mean Aggregation) ---")
     generator_weighted_mean = SignalGenerator(config=mock_config_weighted_mean)
-    signals_weighted_mean = generator_weighted_mean.process_tracked_features(tracked_data_list)
+    signals_weighted_mean = [generator_weighted_mean.generate_signal(o, n, roi_def, q)[0] for o, n, q, roi_def in tracked_data_list_tuples]
     print(f"Calculated Signals (Weighted Mean): {signals_weighted_mean}")
     # Expected Weighted Mean for ROI 8: dy=[1, 3, 6], weights=[10, 1, 1] -> (1*10 + 3*1 + 6*1) / (10+1+1) = 19 / 12 = 1.5833
     print("\n--- Running Assertions (Weighted Mean) ---")
