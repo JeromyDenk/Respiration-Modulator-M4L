@@ -22,7 +22,7 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QGroupBox, QFormLayout, QLabel, QDoubleSpinBox, QComboBox,
-        QPushButton, QSizePolicy, QSpacerItem, QFileDialog, QCheckBox, QMessageBox, QGridLayout, QLineEdit, QSpinBox,
+        QPushButton, QSizePolicy, QSpacerItem, QFileDialog, QCheckBox, QMessageBox, QGridLayout, QLineEdit, QSpinBox, QFrame,
         QSlider # Import QSlider
     )
     from PyQt6.QtCore import QTimer, Qt, pyqtSlot
@@ -54,6 +54,8 @@ except ImportError as e:
 # --- Constants ---
 DEFAULT_RECORDING_DIR = os.path.abspath(os.path.join(script_dir, '..', 'recordings'))
 DEFAULT_RUN_NAME = "run_1" # Placeholder, adjust as needed or use argparse
+DEFAULT_TUNER_SETTINGS_DIR = os.path.join(script_dir, 'profiles')
+DEFAULT_TUNER_SETTINGS_FILE = os.path.join(DEFAULT_TUNER_SETTINGS_DIR, "tuner_settings.json")
 DEFAULT_NPZ_FILE = "raw_pipeline_data.npz"
 
 # --- Feature Plot Window ---
@@ -591,6 +593,17 @@ class TuningWindow(QMainWindow):
         profile_group.setFont(self.larger_font)
         # --- End Profile Management ---
 
+        # --- Raw Signal Source Toggle ---
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        controls_layout.addWidget(line)
+
+        self.raw_signal_source_checkbox = QCheckBox("Plot Raw Signal as: Total Vertical Displacement")
+        self.raw_signal_source_checkbox.setToolTip("If checked, 'Raw Motion Signal' plot displays total vertical displacement. Otherwise, it displays differential displacement.")
+        self.raw_signal_source_checkbox.setFont(self.larger_font)
+        controls_layout.addWidget(self.raw_signal_source_checkbox)
+
         # Signal Generator Settings (Optional - if recalculating raw signal)
         sg_group = QGroupBox("Signal Generation")
         sg_layout = QFormLayout(sg_group)
@@ -610,10 +623,6 @@ class TuningWindow(QMainWindow):
         self.iqr_k_spin = QDoubleSpinBox(minimum=0.5, maximum=5.0, singleStep=0.1, decimals=1, value=1.5)
         self.iqr_k_spin.setFont(self.larger_font)
         self.iqr_k_spin.setEnabled(False) # Disabled by default
-        # --- NEW: Checkbox for Calculate Level Signal ---
-        self.calcLevelSignal_sg_check = QCheckBox("Calculate Absolute Level Signal")
-        self.calcLevelSignal_sg_check.setToolTip("Enable calculation of a raw signal representing absolute vertical position (proxy for lung fullness) by SignalGenerator.")
-        self.calcLevelSignal_sg_check.setFont(self.larger_font)
         self.iqr_filter_checkbox.toggled.connect(self.iqr_k_spin.setEnabled) # Enable/disable spinbox with checkbox
         # --- End IQR Filter Controls ---
 
@@ -627,7 +636,6 @@ class TuningWindow(QMainWindow):
         sg_layout.addRow(self.iqr_filter_checkbox) # Add IQR checkbox
         sg_layout.addRow("IQR k-factor:", self.iqr_k_spin) # Add IQR spinbox
         sg_layout.addRow(self.compare_agg_checkbox) # Add the checkbox to the layout
-        sg_layout.addRow(self.calcLevelSignal_sg_check) # Add the new checkbox
 
         # Signal Processor Settings
         sp_group = QGroupBox("Signal Processing")
@@ -677,6 +685,56 @@ class TuningWindow(QMainWindow):
         # Explicit creation is safer if layout changes
         sp_layout.labelForField(self.filtLow_spin).setFont(self.larger_font)
         sp_layout.labelForField(self.filtHigh_spin).setFont(self.larger_font)
+        # --- Level Signal Processing Settings ---
+        lsp_group = QGroupBox("Level Signal Processing")
+        lsp_layout = QFormLayout(lsp_group)
+        lsp_group.setFont(self.larger_font)
+
+        self.levelDriftCorrection_check = QCheckBox("Enable Drift Correction")
+        self.levelDriftCorrection_check.setFont(self.larger_font)
+        self.levelDriftCorrection_check.setToolTip("Enable subtraction of slow baseline (drift) before normalization.")
+
+        self.levelLightEma_check = QCheckBox("Enable Light EMA Smoothing")
+        self.levelLightEma_check.setFont(self.larger_font)
+        self.levelLightEma_check.setToolTip("Apply a light EMA filter to the raw level signal before further processing.")
+        self.levelLightEmaAlpha_spin = QDoubleSpinBox(minimum=0.01, maximum=0.99, singleStep=0.01, value=0.6, decimals=2)
+        self.levelLightEmaAlpha_spin.setFont(self.larger_font)
+        self.levelLightEmaAlpha_spin.setToolTip("Alpha for light EMA (0.01-0.99). Higher is less smoothing.")
+
+        self.levelBaselineEmaAlpha_spin = QDoubleSpinBox(minimum=0.0001, maximum=0.1, singleStep=0.0001, value=0.002, decimals=4)
+        self.levelBaselineEmaAlpha_spin.setFont(self.larger_font)
+        self.levelBaselineEmaAlpha_spin.setToolTip("Alpha for slow baseline tracking EMA (0.0001-0.1). Smaller is slower (better drift removal for slow drifts).")
+
+        self.levelNormWindow_spin = QDoubleSpinBox(minimum=1.0, maximum=60.0, singleStep=1.0, value=15.0, decimals=1)
+        self.levelNormWindow_spin.setFont(self.larger_font)
+        self.levelNormWindow_spin.setToolTip("Normalization window duration in seconds (1-60s). Determines how quickly normalization adapts to new min/max.")
+
+        self.levelNormToMinusOne_check = QCheckBox("Normalize to [-1, 1]")
+        self.levelNormToMinusOne_check.setFont(self.larger_font)
+        self.levelNormToMinusOne_check.setChecked(True)
+        self.levelNormToMinusOne_check.setToolTip("If checked, normalizes to [-1, 1]. If unchecked, normalizes to [0, 1].")
+
+        self.levelNormEpsilon_spin = QDoubleSpinBox(minimum=1e-6, maximum=1.0, singleStep=1e-3, value=0.01, decimals=6)
+        self.levelNormEpsilon_spin.setFont(self.larger_font)
+        self.levelNormEpsilon_spin.setToolTip("Epsilon for normalization range (1e-6 to 1.0). If range < epsilon, output is neutral (0 or 0.5).")
+
+        lsp_layout.addRow(self.levelDriftCorrection_check)
+        lsp_layout.addRow(self.levelLightEma_check)
+        lsp_layout.addRow("Light EMA Alpha:", self.levelLightEmaAlpha_spin)
+        lsp_layout.addRow("Baseline EMA Alpha:", self.levelBaselineEmaAlpha_spin)
+        lsp_layout.addRow("Norm. Window (s):", self.levelNormWindow_spin)
+        lsp_layout.addRow(self.levelNormToMinusOne_check)
+        lsp_layout.addRow("Norm. Epsilon:", self.levelNormEpsilon_spin)
+        controls_layout.addWidget(lsp_group)
+
+        # Connect signals to enable/disable level processing widgets
+        # Now tied to the SignalGenerator's calculate level signal checkbox
+        self.raw_signal_source_checkbox.toggled.connect(self._update_level_signal_widgets_state)
+        self.levelDriftCorrection_check.toggled.connect(self._update_level_signal_widgets_state) # Also update on drift toggle
+        self.levelLightEma_check.toggled.connect(self._update_level_signal_widgets_state)
+        self._update_level_signal_widgets_state() # Initial state
+        # --- End Level Signal Processing Settings ---
+
         sp_layout.labelForField(self.emaAlpha_spin).setFont(self.larger_font)
         sp_layout.labelForField(self.padType_combo).setFont(self.larger_font)
         sp_layout.labelForField(self.padLen_spin).setFont(self.larger_font)
@@ -728,20 +786,58 @@ class TuningWindow(QMainWindow):
 
 
         # Apply Button
-        self.apply_button = QPushButton("Apply Settings & Reprocess")
-        self.apply_button.clicked.connect(self._reprocess_data)
-        controls_layout.addWidget(self.apply_button)
+        self.reload_tuner_settings_button = QPushButton("Reload Tuner Settings")
+        self.reload_tuner_settings_button.setToolTip(f"Reloads tuner UI settings from {DEFAULT_TUNER_SETTINGS_FILE}")
+        self.reload_tuner_settings_button.clicked.connect(self._load_tuner_settings_from_file)
+
+        self.save_tuner_settings_button = QPushButton("Save Tuner Settings") # Renamed from apply_button
+        self.save_tuner_settings_button.setToolTip(f"Saves current tuner UI settings to {DEFAULT_TUNER_SETTINGS_FILE}")
+        self.save_tuner_settings_button.clicked.connect(self._save_tuner_settings_to_file)
+
+        settings_button_layout = QHBoxLayout()
+        settings_button_layout.addWidget(self.reload_tuner_settings_button)
+        settings_button_layout.addWidget(self.save_tuner_settings_button)
+        controls_layout.addLayout(settings_button_layout)
 
         controls_layout.addStretch(1) # Push controls to the top
         main_layout.addWidget(controls_container, 1) # Give controls less space
 
-        # Connect signals for automatic reprocessing (optional, can rely on button)
-        # self.aggMethod_combo.currentIndexChanged.connect(self._reprocess_data)
-        # self.recalc_raw_checkbox.stateChanged.connect(self._reprocess_data)
-        # self.filtLow_spin.valueChanged.connect(self._reprocess_data)
-        # self.filtHigh_spin.valueChanged.connect(self._reprocess_data)
-        # self.filtType_combo.currentIndexChanged.connect(self._reprocess_data)
-        # self.peakProm_spin.valueChanged.connect(self._reprocess_data)
+        # --- Connect signals for automatic reprocessing ---
+        # Signal Generation
+        self.aggMethod_combo.currentIndexChanged.connect(self._reprocess_data_slot)
+        self.recalc_raw_checkbox.toggled.connect(self._reprocess_data_slot)
+        self.compare_agg_checkbox.toggled.connect(self._reprocess_data_slot)
+        self.iqr_filter_checkbox.toggled.connect(self._reprocess_data_slot)
+        self.iqr_k_spin.valueChanged.connect(self._reprocess_data_slot)
+        self.raw_signal_source_checkbox.toggled.connect(self._reprocess_data_slot) # Changed from calcLevelSignal_sg_check
+
+        # Signal Processing (Differential Path)
+        self.filtLow_spin.valueChanged.connect(self._reprocess_data_slot)
+        self.filtHigh_spin.valueChanged.connect(self._reprocess_data_slot)
+        self.filtType_combo.currentIndexChanged.connect(self._reprocess_data_slot)
+        self.emaAlpha_spin.valueChanged.connect(self._reprocess_data_slot)
+        self.peakProm_spin.valueChanged.connect(self._reprocess_data_slot)
+        self.padType_combo.currentIndexChanged.connect(self._reprocess_data_slot)
+        self.padLen_spin.valueChanged.connect(self._reprocess_data_slot)
+
+        # Level Signal Processing
+        self.levelLightEma_check.toggled.connect(self._reprocess_data_slot)
+        self.levelLightEmaAlpha_spin.valueChanged.connect(self._reprocess_data_slot)
+        self.levelDriftCorrection_check.toggled.connect(self._reprocess_data_slot) # Add this connection
+        self.levelBaselineEmaAlpha_spin.valueChanged.connect(self._reprocess_data_slot)
+        self.levelNormWindow_spin.valueChanged.connect(self._reprocess_data_slot)
+        self.levelNormToMinusOne_check.toggled.connect(self._reprocess_data_slot)
+        self.levelNormEpsilon_spin.valueChanged.connect(self._reprocess_data_slot)
+
+        # Spectrum Analyzer (these primarily affect spectrum/histogram plots, but _reprocess_data updates them too)
+        self.fft_window_size_combo.currentIndexChanged.connect(self._reprocess_data_slot)
+        self.fft_window_type_combo.currentIndexChanged.connect(self._reprocess_data_slot)
+        self.fft_padding_combo.currentIndexChanged.connect(self._reprocess_data_slot)
+        self.db_scale_check.toggled.connect(self._reprocess_data_slot)
+        self.plot_raw_spectrum_check.toggled.connect(self._reprocess_data_slot)
+        self.plot_filtered_spectrum_check.toggled.connect(self._reprocess_data_slot)
+        self.show_peak_freq_check.toggled.connect(self._reprocess_data_slot)
+        self.hist_bins_spin.valueChanged.connect(self._reprocess_data_slot)
 
     def load_data(self, file_path):
         """Loads data from the specified .npz file."""
@@ -797,7 +893,7 @@ class TuningWindow(QMainWindow):
             'SIGNAL_AGGREGATION_METHOD': self.aggMethod_combo.currentText(),
             'IQR_FILTER_ENABLED': self.iqr_filter_checkbox.isChecked(), # Read IQR checkbox
             'IQR_K_FACTOR': self.iqr_k_spin.value(), # Read IQR spinbox
-            'CALCULATE_LEVEL_SIGNAL': self.calcLevelSignal_sg_check.isChecked() # Read new checkbox
+            'CALCULATE_LEVEL_SIGNAL': self.raw_signal_source_checkbox.isChecked() 
         }
         sp_config = {
             'SIGNAL_FILTER_LOW_HZ': self.filtLow_spin.value(),
@@ -808,6 +904,18 @@ class TuningWindow(QMainWindow):
             'PAD_TYPE': self.padType_combo.currentText(), # Add pad_type
             'PAD_LEN': self.padLen_spin.value()          # Add pad_len
         }
+        # Add level signal processing settings
+        # PROCESS_LEVEL_SIGNAL_ENABLED in SignalProcessor is now controlled by
+        # whether the SignalGenerator is calculating the level signal.
+        sp_config['PROCESS_LEVEL_SIGNAL_ENABLED'] = self.raw_signal_source_checkbox.isChecked()
+        if self.raw_signal_source_checkbox.isChecked(): # Only add these if SG is calculating level signal
+            sp_config['LEVEL_SIGNAL_DRIFT_CORRECTION_ENABLED'] = self.levelDriftCorrection_check.isChecked()
+            sp_config['LEVEL_SIGNAL_LIGHT_EMA_ALPHA'] = self.levelLightEmaAlpha_spin.value() if self.levelLightEma_check.isChecked() else None
+            sp_config['LEVEL_SIGNAL_BASELINE_EMA_ALPHA'] = self.levelBaselineEmaAlpha_spin.value()
+            sp_config['LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS'] = self.levelNormWindow_spin.value()
+            sp_config['LEVEL_SIGNAL_NORMALIZE_TO_MINUS_ONE_ONE'] = self.levelNormToMinusOne_check.isChecked()
+            sp_config['LEVEL_SIGNAL_NORMALIZATION_EPSILON'] = self.levelNormEpsilon_spin.value()
+
         # --- ADD DEBUG PRINT ---
         print(f"[Tuner Debug] SignalProcessor config being applied: {sp_config}")
 
@@ -831,7 +939,7 @@ class TuningWindow(QMainWindow):
                 'SIGNAL_AGGREGATION_METHOD': self.aggMethod_combo.currentText(),
                 'IQR_FILTER_ENABLED': self.iqr_filter_checkbox.isChecked(), # Save IQR state
                 'IQR_K_FACTOR': self.iqr_k_spin.value(), # Save IQR k-factor
-                'CALCULATE_LEVEL_SIGNAL': self.calcLevelSignal_sg_check.isChecked() # Save new setting
+                'CALCULATE_LEVEL_SIGNAL': self.raw_signal_source_checkbox.isChecked() 
             },
             'signal_processor': {
                 'SIGNAL_FILTER_LOW_HZ': self.filtLow_spin.value(),
@@ -840,7 +948,18 @@ class TuningWindow(QMainWindow):
                 'EMA_ALPHA': self.emaAlpha_spin.value(),
                 'PEAK_DETECT_PROMINENCE': self.peakProm_spin.value() if self.peakProm_spin.value() > 1e-6 else None, # Keep this
                 'PAD_TYPE': self.padType_combo.currentText(),
-                'PAD_LEN': self.padLen_spin.value()
+                'PAD_LEN': self.padLen_spin.value(),
+                # Level signal processing settings
+                # PROCESS_LEVEL_SIGNAL_ENABLED in SignalProcessor is now controlled by
+                # whether the SignalGenerator is calculating the level signal.
+                'LEVEL_SIGNAL_DRIFT_CORRECTION_ENABLED': self.levelDriftCorrection_check.isChecked(),
+                'PROCESS_LEVEL_SIGNAL_ENABLED': self.raw_signal_source_checkbox.isChecked(),
+                # SignalProcessor will ignore them if PROCESS_LEVEL_SIGNAL_ENABLED is false.
+                'LEVEL_SIGNAL_LIGHT_EMA_ALPHA': self.levelLightEmaAlpha_spin.value() if self.levelLightEma_check.isChecked() else None,
+                'LEVEL_SIGNAL_BASELINE_EMA_ALPHA': self.levelBaselineEmaAlpha_spin.value(),
+                'LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS': self.levelNormWindow_spin.value(),
+                'LEVEL_SIGNAL_NORMALIZE_TO_MINUS_ONE_ONE': self.levelNormToMinusOne_check.isChecked(),
+                'LEVEL_SIGNAL_NORMALIZATION_EPSILON': self.levelNormEpsilon_spin.value()
             }
         }
         return settings
@@ -861,8 +980,8 @@ class TuningWindow(QMainWindow):
             self.iqr_filter_checkbox.setChecked(iqr_enabled)
             self.iqr_k_spin.setValue(sg_settings.get('IQR_K_FACTOR', 1.5))
             self.iqr_k_spin.setEnabled(iqr_enabled) # Ensure spinbox state matches checkbox
-            # --- Populate Calculate Level Signal checkbox ---
-            self.calcLevelSignal_sg_check.setChecked(sg_settings.get('CALCULATE_LEVEL_SIGNAL', False))
+            # --- Populate Raw Signal Source checkbox ---
+            self.raw_signal_source_checkbox.setChecked(sg_settings.get('CALCULATE_LEVEL_SIGNAL', False))
 
             # Populate Signal Processor widgets
             self.filtLow_spin.setValue(sp_settings.get('SIGNAL_FILTER_LOW_HZ', 0.1))
@@ -877,7 +996,22 @@ class TuningWindow(QMainWindow):
             self.padType_combo.setCurrentText(sp_settings.get('PAD_TYPE', 'gust')) # Default to 'gust'
             self.padLen_spin.setValue(sp_settings.get('PAD_LEN', 0)) # Default to 0
 
+            # Populate Level Signal Processing widgets
+            # The 'PROCESS_LEVEL_SIGNAL_ENABLED' from the profile is used by SignalProcessor,
+            # but the UI widgets' enabled state is now driven by raw_signal_source_checkbox.
+            # We don't need to set a checkbox for it anymore.
+            light_ema_alpha = sp_settings.get('LEVEL_SIGNAL_LIGHT_EMA_ALPHA', None) # Default to None if key missing
+            self.levelDriftCorrection_check.setChecked(sp_settings.get('LEVEL_SIGNAL_DRIFT_CORRECTION_ENABLED', True)) # Default to True
+            self.levelLightEma_check.setChecked(light_ema_alpha is not None)
+            self.levelLightEmaAlpha_spin.setValue(light_ema_alpha if light_ema_alpha is not None else 0.6) # Default UI value if None
+            
+            self.levelBaselineEmaAlpha_spin.setValue(sp_settings.get('LEVEL_SIGNAL_BASELINE_EMA_ALPHA', 0.002))
+            self.levelNormWindow_spin.setValue(sp_settings.get('LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS', 15.0))
+            self.levelNormToMinusOne_check.setChecked(sp_settings.get('LEVEL_SIGNAL_NORMALIZE_TO_MINUS_ONE_ONE', True))
+            self.levelNormEpsilon_spin.setValue(sp_settings.get('LEVEL_SIGNAL_NORMALIZATION_EPSILON', 0.01))
+
             self._update_filter_param_widgets_state() # Update enabled states based on loaded method
+            self._update_level_signal_widgets_state() # Update enabled states for level signal widgets
 
             print("[UI] Settings widgets populated.")
 
@@ -885,6 +1019,12 @@ class TuningWindow(QMainWindow):
             print(f"Error populating settings widgets: {e}")
             traceback.print_exc()
             QMessageBox.warning(self, "Settings Error", f"Could not fully populate settings widgets from profile:\n{e}")
+
+    @pyqtSlot()
+    def _reprocess_data_slot(self):
+        """Slot to connect UI signals to _reprocess_data.
+        This can be used if a slight delay or debouncing is needed in the future."""
+        self._reprocess_data()
 
     @pyqtSlot()
     def _load_profile(self):
@@ -1043,14 +1183,14 @@ class TuningWindow(QMainWindow):
                 signal_val, raw_level_signal_val, _points_output = self.signal_generator.generate_signal(
                     old_p_frame, new_p_frame, None, None
                 )
-                if self.calcLevelSignal_sg_check.isChecked():
+                if self.raw_signal_source_checkbox.isChecked():
                     # Using the raw_level_signal
                     recalculated_primary_signal_list.append(raw_level_signal_val if raw_level_signal_val is not None else 0.0)
                 else:
                     # Using the raw_differential_signal
                     recalculated_primary_signal_list.append(signal_val)
 
-            if self.calcLevelSignal_sg_check.isChecked():
+            if self.raw_signal_source_checkbox.isChecked():
                 self.raw_signal_processed = np.array(recalculated_primary_signal_list) # No inversion for level signal
                 print(f"Raw signal recalculated as ABSOLUTE LEVEL signal using SignalGenerator.")
             else:
@@ -1058,8 +1198,8 @@ class TuningWindow(QMainWindow):
                 print(f"Raw signal recalculated as DIFFERENTIAL signal using SignalGenerator ({self.signal_generator.aggregation_method}, IQR: {self.signal_generator.iqr_filter_enabled}).")
 
             # --- Handle Compare Mode ---
-            # Comparison only makes sense if we are NOT showing the absolute level signal as primary
-            if self.compare_agg_checkbox.isChecked() and not self.calcLevelSignal_sg_check.isChecked():
+            # Comparison only makes sense if we are NOT showing the total displacement signal as primary
+            if self.compare_agg_checkbox.isChecked() and not self.raw_signal_source_checkbox.isChecked():
                 # Create a temporary generator with the *opposite* aggregation method
                 # but the same IQR settings
                 primary_method = self.signal_generator.aggregation_method
@@ -1108,23 +1248,59 @@ class TuningWindow(QMainWindow):
         print("Processing raw signal with SignalProcessor...")
         # Resetting is not needed as SignalProcessor is re-initialized in _apply_settings()
         # self.signal_processor.reset()
-        # Process the entire raw signal history
-        # --- MODIFIED: Process signal value by value ---
+
         processed_filtered_signal = []
+        is_processing_level_for_display = self.raw_signal_source_checkbox.isChecked() and \
+                                          self.signal_processor.process_level_signal_enabled # Check SG and if SP is actually enabled
+                                                                                             # (which it should be if raw_signal_source_checkbox is true due to _apply_settings)
+                                                                                             
         for raw_value in self.raw_signal_processed:
-            self.signal_processor.process_signal_values([raw_value]) # Pass as a list containing one value
-            processed_filtered_signal.append(self.signal_processor.get_latest_filtered_value())
+            if self.raw_signal_source_checkbox.isChecked():
+                # Raw signal is absolute level. Feed it to the level path of SignalProcessor.
+                # Pass a dummy [0.0] for the differential path as we're not using its output here.
+                self.signal_processor.process_signal_values([0.0], raw_level_signal_value=raw_value)
+                if is_processing_level_for_display:
+                    processed_filtered_signal.append(self.signal_processor.get_processed_level_signal())
+                else: # Level processing in SP might be off, or SG is level but SP is not processing level
+                    processed_filtered_signal.append(0.0) # Show flat line if not properly configured
+            else:
+                # Raw signal is differential. Feed it to the differential path.
+                # Level signal input to SP is None.
+                self.signal_processor.process_signal_values([raw_value], raw_level_signal_value=None)
+                processed_filtered_signal.append(self.signal_processor.get_latest_filtered_value())
+
         self.filtered_signal_processed = np.array(processed_filtered_signal)
+
         print(f"Signal processed ({len(self.filtered_signal_processed)} filtered points).")
 
         # --- Update Plots ---
-        valid_timestamps = self.timestamps[:len(self.raw_signal_processed)] # Match length
+        # Update raw plot title
+        if self.raw_signal_source_checkbox.isChecked():
+            self.raw_plot_widget.setTitle("Raw Total Vertical Displacement Signal")
+        else:
+            self.raw_plot_widget.setTitle("Raw Differential Signal")
+
+        valid_timestamps = self.timestamps[:len(self.raw_signal_processed)] 
         self.raw_plot_curve.setData(valid_timestamps, self.raw_signal_processed)
         # --- Update alt raw curve if needed ---
         if self.raw_signal_alt_processed is not None:
             self.raw_plot_curve_alt.setData(valid_timestamps, self.raw_signal_alt_processed)
         else:
             self.raw_plot_curve_alt.clear() # Clear if not comparing
+
+        # Update filtered plot title and Y-axis based on what's being shown
+        if is_processing_level_for_display:
+            self.filtered_plot_widget.setTitle("Processed Absolute Level Signal (Drift Corrected & Normalized)")
+            # Set Y-axis for normalized signal (typically -1 to 1 or 0 to 1)
+            if self.signal_processor.level_normalize_to_minus_one_one:
+                self.filtered_plot_widget.setYRange(-1.1, 1.1, padding=0)
+            else:
+                self.filtered_plot_widget.setYRange(-0.1, 1.1, padding=0)
+            self.filtered_plot_widget.getViewBox().enableAutoRange(axis=pg.ViewBox.XAxis) # Keep X auto-range
+            self.filtered_plot_widget.getViewBox().disableAutoRange(axis=pg.ViewBox.YAxis) # Disable Y auto-range
+        else:
+            self.filtered_plot_widget.setTitle("Filtered Differential Signal")
+            self.filtered_plot_widget.getViewBox().enableAutoRange() # Enable full auto-range for differential
 
         self.filtered_plot_curve.setData(valid_timestamps, self.filtered_signal_processed)
         print("Plots updated.")
@@ -1454,6 +1630,47 @@ class TuningWindow(QMainWindow):
             self._update_plots_for_frame(value)
 
     @pyqtSlot()
+    def _load_tuner_settings_from_file(self):
+        """Loads tuner UI settings from the predefined JSON file and applies them."""
+        if not os.path.exists(DEFAULT_TUNER_SETTINGS_FILE):
+            print(f"Tuner settings file not found: {DEFAULT_TUNER_SETTINGS_FILE}")
+            QMessageBox.warning(self, "Load Error", f"Tuner settings file not found:\n{DEFAULT_TUNER_SETTINGS_FILE}")
+            return
+
+        try:
+            with open(DEFAULT_TUNER_SETTINGS_FILE, 'r') as f:
+                loaded_settings = json.load(f)
+            self._populate_ui_from_settings(loaded_settings)
+            self._reprocess_data() # Reprocess with newly loaded settings
+            print(f"Tuner settings reloaded successfully from: {DEFAULT_TUNER_SETTINGS_FILE}")
+            QMessageBox.information(self, "Reload Successful", f"Tuner settings reloaded from:\n{DEFAULT_TUNER_SETTINGS_FILE}")
+        except Exception as e:
+            print(f"Error reloading tuner settings: {e}")
+            QMessageBox.critical(self, "Reload Error", f"Failed to reload tuner settings:\n{DEFAULT_TUNER_SETTINGS_FILE}\n\n{e}")
+
+    @pyqtSlot()
+    def _save_tuner_settings_to_file(self):
+        """Saves the current tuner UI settings to a predefined JSON file."""
+        if not os.path.exists(DEFAULT_TUNER_SETTINGS_DIR):
+            try:
+                os.makedirs(DEFAULT_TUNER_SETTINGS_DIR)
+                print(f"Created directory: {DEFAULT_TUNER_SETTINGS_DIR}")
+            except Exception as e:
+                print(f"Error creating directory {DEFAULT_TUNER_SETTINGS_DIR}: {e}")
+                QMessageBox.critical(self, "Save Error", f"Could not create directory:\n{DEFAULT_TUNER_SETTINGS_DIR}\n\n{e}")
+                return
+
+        current_settings = self._gather_settings_from_ui()
+        try:
+            with open(DEFAULT_TUNER_SETTINGS_FILE, 'w') as f:
+                json.dump(current_settings, f, indent=4)
+            print(f"Tuner settings saved successfully to: {DEFAULT_TUNER_SETTINGS_FILE}")
+            QMessageBox.information(self, "Save Successful", f"Tuner settings saved to:\n{DEFAULT_TUNER_SETTINGS_FILE}")
+        except Exception as e:
+            print(f"Error saving tuner settings: {e}")
+            QMessageBox.critical(self, "Save Error", f"Failed to save tuner settings:\n{DEFAULT_TUNER_SETTINGS_FILE}\n\n{e}")
+
+    @pyqtSlot()
     def _pause_on_slider_press(self):
         """Pauses playback when the user starts dragging the slider."""
         if self.is_playing:
@@ -1480,6 +1697,23 @@ class TuningWindow(QMainWindow):
 
         # EMA specific params
         self.emaAlpha_spin.setEnabled(is_ema)
+
+    def _update_level_signal_widgets_state(self):
+        """Enables/disables level signal parameter widgets based on the master enable checkbox."""
+        # Master enable for this UI group is now self.raw_signal_source_checkbox
+        group_enabled = self.raw_signal_source_checkbox.isChecked() # If the SG is calculating level signal
+        drift_correction_enabled_ui = self.levelDriftCorrection_check.isChecked()
+        light_ema_itself_enabled = self.levelLightEma_check.isChecked()
+
+        self.levelDriftCorrection_check.setEnabled(group_enabled)
+        self.levelLightEma_check.setEnabled(group_enabled)
+        # Light EMA Alpha is only enabled if BOTH master and its own checkbox are checked
+        self.levelLightEmaAlpha_spin.setEnabled(group_enabled and light_ema_itself_enabled)
+        self.levelBaselineEmaAlpha_spin.setEnabled(group_enabled and drift_correction_enabled_ui) # Baseline alpha only if drift correction is on
+        self.levelNormWindow_spin.setEnabled(group_enabled)
+        self.levelNormToMinusOne_check.setEnabled(group_enabled)
+        self.levelNormEpsilon_spin.setEnabled(group_enabled)
+
 
     def closeEvent(self, event):
         """Stops timer on close."""
