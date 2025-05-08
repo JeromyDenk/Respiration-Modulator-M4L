@@ -49,3 +49,21 @@ Feature Quality Weighting (Shi-Tomasi Score)
 Add TQDM to webcam feed when loading
 
 Explore Kalman Filter to filter noise from raw motion signal
+
+Option to choose either A - differential signal (current implementation) or B - Derive a Level Metric
+
+You've hit on a very important distinction in signal processing for control versus analysis! The current raw signal (based on frame-to-frame displacement of features) is excellent for detecting the rhythm and phase of breathing, which is why it works well for BPM. However, as you've correctly observed, it doesn't represent the absolute level or sustained state of your breath (like a held inhale).
+
+When you hold your breath, the features become relatively static from one frame to the next. Thus, new_points - old_points becomes close to zero. The EMA then faithfully smooths this near-zero input, causing its output to also return towards zero.
+
+To get a signal that reflects the current expansion level of your chest for OSC modulation, we need to derive a different kind of raw signal from the feature points—one that represents an absolute position or extent, rather than just change.
+
+Here's how we can change that, focusing on creating a separate, level-based signal path specifically for your OSC output, while leaving the existing displacement-based signal path intact for BPM/phase calculation:
+
+The Strategy: Derive a Level Metric and Smooth It
+
+Derive a "Raw Level Metric": In PipelineManager, after getting the current_tracked_points (which are the absolute coordinates of features in the current frame), we can calculate a simple metric that represents the overall vertical position of these features. A good candidate is the mean Y-coordinate of the tracked points.
+When you inhale, your chest (and the features on it) tends to move upwards, so the mean Y-coordinate would decrease (assuming Y=0 is at the top of the frame).
+When you hold that inhale, the mean Y-coordinate would stay at that new, lower value.
+Smooth this Raw Level Metric: Apply a simple Exponential Moving Average (EMA) to this new raw_level_metric. This will smooth out jitter while still allowing the signal to track and hold sustained levels.
+Output for OSC: This smoothed level signal will then be suitable for your OSC modulation.

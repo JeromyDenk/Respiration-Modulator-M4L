@@ -393,10 +393,14 @@ class MainWindow(QMainWindow):
         self.filtLow_spin = QDoubleSpinBox(minimum=0.05, maximum=1.00, singleStep=0.01, decimals=2)
         self.filtHigh_spin = QDoubleSpinBox(minimum=0.10, maximum=5.00, singleStep=0.05, decimals=2)
         self.filtType_combo = QComboBox()
-        self.filtType_combo.addItems(["lfilter", "filtfilt"])
+        self.filtType_combo.addItems(["lfilter", "filtfilt", "ema"]) # Added "ema"
         self.peakProm_spin = QDoubleSpinBox(minimum=0.0, maximum=10.0, singleStep=0.005, value=0.0, decimals=3)
 
+        self.emaAlpha_spin = QDoubleSpinBox(minimum=0.01, maximum=1.0, singleStep=0.01, value=0.1, decimals=3)
+        self.emaAlpha_spin.setToolTip("Smoothing factor for EMA (0.01-1.0). Smaller is more smoothing.")
+
         # Add tooltips (already present)
+        # Note: filtType_combo tooltip might need updating if it only mentions lfilter/filtfilt
         self.filtLow_spin.setToolTip("Lower cutoff frequency (Hz) for bandpass filter.")
         self.filtHigh_spin.setToolTip("Upper cutoff frequency (Hz) for bandpass filter.")
         self.filtType_combo.setToolTip("Filter method: lfilter (causal, faster) or filtfilt (zero-phase, slower).")
@@ -420,15 +424,21 @@ class MainWindow(QMainWindow):
         sp_layout.addRow("Filter High:", filtHigh_layout) # Add the HBox layout to the form row
 
         sp_layout.addRow("Filter Method:", self.filtType_combo)
+        sp_layout.addRow("EMA Alpha:", self.emaAlpha_spin) # Add EMA Alpha spinbox
         sp_layout.addRow("Peak Prominence:", self.peakProm_spin)
 
         # Apply larger font and fixed height to SP input widgets
         for widget in [self.aggMethod_combo, self.filtLow_spin, self.filtHigh_spin,
-                       self.filtType_combo, self.peakProm_spin]:
+                       self.filtType_combo, self.emaAlpha_spin, self.peakProm_spin]:
             widget.setFont(larger_font)
             widget.setFixedHeight(28) # Optional: Adjust height
 
         settings_row_layout.addWidget(sp_group) # Add group to the horizontal layout
+
+        # Connect signal for filter type change to update widget states
+        self.filtType_combo.currentIndexChanged.connect(self._update_filter_param_widgets_state_main_ui)
+        # Call it once to set initial state
+        self._update_filter_param_widgets_state_main_ui()
 
         # Add the row containing both group boxes to the main settings layout
         settings_main_layout.addLayout(settings_row_layout)
@@ -755,7 +765,8 @@ class MainWindow(QMainWindow):
                 'SIGNAL_FILTER_LOW_HZ': self.filtLow_spin.value(),
                 'SIGNAL_FILTER_HIGH_HZ': self.filtHigh_spin.value(),
                 'SIGNAL_FILTER_METHOD': self.filtType_combo.currentText(),
-                # Convert 0.0 from spinbox back to None for peak detection logic
+                'EMA_ALPHA': self.emaAlpha_spin.value(), # Add EMA Alpha
+                # Convert 0.0 from spinbox back to None for peak detection logic (already handled)
                 'PEAK_DETECT_PROMINENCE': self.peakProm_spin.value() if self.peakProm_spin.value() > 1e-6 else None
             }
         }
@@ -785,6 +796,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'settings_toggle_button'): self.settings_toggle_button.setEnabled(components_ready)
 
         # Show Pose is enabled when components are ready AND not actively tracking (i.e., previewing)
+        # This logic remains correct.
         self.pose_overlay_check.setEnabled(is_previewing and components_ready)
         self.roi_overlay_check.setEnabled(components_ready)
         self.features_overlay_check.setEnabled(self.tracking_active and components_ready)
@@ -968,7 +980,28 @@ class MainWindow(QMainWindow):
             self.filtLow_spin.setValue(signal_processor_settings.get('SIGNAL_FILTER_LOW_HZ', 0.1)); self.filtHigh_spin.setValue(signal_processor_settings.get('SIGNAL_FILTER_HIGH_HZ', 1.0)); filt_method = signal_processor_settings.get('SIGNAL_FILTER_METHOD', 'lfilter'); self.filtType_combo.setCurrentText(filt_method)
             prominence = signal_processor_settings.get('PEAK_DETECT_PROMINENCE'); self.peakProm_spin.setValue(prominence if prominence is not None else 0.0)
             self.statusBar.showMessage("Settings populated.", 3000)
+            # Populate EMA Alpha
+            self.emaAlpha_spin.setValue(signal_processor_settings.get('EMA_ALPHA', 0.1))
+            # Update enabled state of filter params based on loaded method
+            self._update_filter_param_widgets_state_main_ui()
         except Exception as e: print(f"Error populating settings widgets: {e}"); traceback.print_exc(); self.statusBar.showMessage("Error loading settings into UI.", 3000); QMessageBox.warning(self, "Settings Error", f"Could not fully populate settings widgets:\n{e}")
+
+    def _update_filter_param_widgets_state_main_ui(self):
+        """Enables/disables filter parameter widgets based on the selected filter method in the main UI."""
+        selected_method = self.filtType_combo.currentText()
+
+        is_butter_filtfilt = selected_method in ['lfilter', 'filtfilt']
+        is_ema = selected_method == 'ema'
+
+        # Butterworth/filtfilt specific params
+        self.filtLow_spin.setEnabled(is_butter_filtfilt)
+        self.filtHigh_spin.setEnabled(is_butter_filtfilt)
+        # Assuming filter order and type are fixed for now. If they were widgets:
+        # self.filterOrder_spin.setEnabled(is_butter_filtfilt)
+        # self.filterButterType_combo.setEnabled(is_butter_filtfilt)
+
+        # EMA specific params
+        self.emaAlpha_spin.setEnabled(is_ema)
 
 
     def closeEvent(self, event):
