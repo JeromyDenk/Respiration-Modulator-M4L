@@ -399,6 +399,10 @@ class MainWindow(QMainWindow):
         self.emaAlpha_spin = QDoubleSpinBox(minimum=0.01, maximum=1.0, singleStep=0.01, value=0.1, decimals=3)
         self.emaAlpha_spin.setToolTip("Smoothing factor for EMA (0.01-1.0). Smaller is more smoothing.")
 
+        # --- ADDED: Checkbox for Calculate Level Signal ---
+        self.calcLevelSignal_check = QCheckBox("Calculate Absolute Level Signal")
+        self.calcLevelSignal_check.setToolTip("Enable calculation of a raw signal representing absolute vertical position (proxy for lung fullness).")
+
         # Add tooltips (already present)
         # Note: filtType_combo tooltip might need updating if it only mentions lfilter/filtfilt
         self.filtLow_spin.setToolTip("Lower cutoff frequency (Hz) for bandpass filter.")
@@ -426,10 +430,11 @@ class MainWindow(QMainWindow):
         sp_layout.addRow("Filter Method:", self.filtType_combo)
         sp_layout.addRow("EMA Alpha:", self.emaAlpha_spin) # Add EMA Alpha spinbox
         sp_layout.addRow("Peak Prominence:", self.peakProm_spin)
+        sp_layout.addRow(self.calcLevelSignal_check) # Add the new checkbox
 
         # Apply larger font and fixed height to SP input widgets
         for widget in [self.aggMethod_combo, self.filtLow_spin, self.filtHigh_spin,
-                       self.filtType_combo, self.emaAlpha_spin, self.peakProm_spin]:
+                       self.filtType_combo, self.emaAlpha_spin, self.peakProm_spin, self.calcLevelSignal_check]:
             widget.setFont(larger_font)
             widget.setFixedHeight(28) # Optional: Adjust height
 
@@ -759,7 +764,8 @@ class MainWindow(QMainWindow):
                 'FEATURE_REDETECT_THRESHOLD': int(self.maxCorners_spin.value() * 0.7)
             },
             'signal_generator': {
-                'SIGNAL_AGGREGATION_METHOD': self.aggMethod_combo.currentText()
+                'SIGNAL_AGGREGATION_METHOD': self.aggMethod_combo.currentText(),
+                'CALCULATE_LEVEL_SIGNAL': self.calcLevelSignal_check.isChecked() # Add new setting
             },
             'signal_processor': {
                 'SIGNAL_FILTER_LOW_HZ': self.filtLow_spin.value(),
@@ -982,6 +988,8 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage("Settings populated.", 3000)
             # Populate EMA Alpha
             self.emaAlpha_spin.setValue(signal_processor_settings.get('EMA_ALPHA', 0.1))
+            # Populate Calculate Level Signal checkbox
+            self.calcLevelSignal_check.setChecked(signal_generator_settings.get('CALCULATE_LEVEL_SIGNAL', False))
             # Update enabled state of filter params based on loaded method
             self._update_filter_param_widgets_state_main_ui()
         except Exception as e: print(f"Error populating settings widgets: {e}"); traceback.print_exc(); self.statusBar.showMessage("Error loading settings into UI.", 3000); QMessageBox.warning(self, "Settings Error", f"Could not fully populate settings widgets:\n{e}")

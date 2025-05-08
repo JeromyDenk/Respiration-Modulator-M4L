@@ -491,6 +491,8 @@ class TuningWindow(QMainWindow):
         self.spectrum_plot_widget.getAxis('left').setTickFont(self.larger_font)
         self.raw_spectrum_curve = self.spectrum_plot_widget.plot(pen=pg.mkPen(color=(100, 100, 255, 150), width=1.5), name="Raw") # Slightly transparent blue
         self.filtered_spectrum_curve = self.spectrum_plot_widget.plot(pen=pg.mkPen(color=(100, 255, 100, 150), width=1.5), name="Filtered") # Slightly transparent green
+        # --- Set default X range for spectrum plot ---
+        self.spectrum_plot_widget.setXRange(0, 4)
         # --- Add second curve for raw signal plot ---
         self.raw_plot_curve_alt = self.raw_plot_widget.plot(pen=pg.mkPen(color=(255, 165, 0, 200), width=2), name="Median/Mean") # Orange, slightly transparent
         # --- Add text item for peak frequency ---
@@ -513,8 +515,10 @@ class TuningWindow(QMainWindow):
         self.disp_histogram_widget.getAxis('left').setTickFont(self.larger_font)
         # Initialize without data, stepMode will be handled by setData later
         self.disp_histogram_curve = pg.PlotCurveItem(pen='y', fillLevel=0, brush=(255,255,0,80))
+        # --- Set default X and Y ranges for histogram and disable auto-ranging ---
+        self.disp_histogram_widget.setXRange(-3, 3, padding=0)
+        self.disp_histogram_widget.setYRange(0, 60, padding=0)
         self.disp_histogram_widget.addItem(self.disp_histogram_curve)
-        # --- Disable auto-ranging for histogram ---
         self.disp_histogram_widget.getViewBox().disableAutoRange()
         plot_layout.addWidget(self.spectrum_plot_widget) # Add spectrum plot below
         plot_layout.addWidget(self.disp_histogram_widget) # Add histogram plot at the bottom
@@ -606,6 +610,10 @@ class TuningWindow(QMainWindow):
         self.iqr_k_spin = QDoubleSpinBox(minimum=0.5, maximum=5.0, singleStep=0.1, decimals=1, value=1.5)
         self.iqr_k_spin.setFont(self.larger_font)
         self.iqr_k_spin.setEnabled(False) # Disabled by default
+        # --- NEW: Checkbox for Calculate Level Signal ---
+        self.calcLevelSignal_sg_check = QCheckBox("Calculate Absolute Level Signal")
+        self.calcLevelSignal_sg_check.setToolTip("Enable calculation of a raw signal representing absolute vertical position (proxy for lung fullness) by SignalGenerator.")
+        self.calcLevelSignal_sg_check.setFont(self.larger_font)
         self.iqr_filter_checkbox.toggled.connect(self.iqr_k_spin.setEnabled) # Enable/disable spinbox with checkbox
         # --- End IQR Filter Controls ---
 
@@ -619,6 +627,7 @@ class TuningWindow(QMainWindow):
         sg_layout.addRow(self.iqr_filter_checkbox) # Add IQR checkbox
         sg_layout.addRow("IQR k-factor:", self.iqr_k_spin) # Add IQR spinbox
         sg_layout.addRow(self.compare_agg_checkbox) # Add the checkbox to the layout
+        sg_layout.addRow(self.calcLevelSignal_sg_check) # Add the new checkbox
 
         # Signal Processor Settings
         sp_group = QGroupBox("Signal Processing")
@@ -787,7 +796,8 @@ class TuningWindow(QMainWindow):
         sg_config = {
             'SIGNAL_AGGREGATION_METHOD': self.aggMethod_combo.currentText(),
             'IQR_FILTER_ENABLED': self.iqr_filter_checkbox.isChecked(), # Read IQR checkbox
-            'IQR_K_FACTOR': self.iqr_k_spin.value() # Read IQR spinbox
+            'IQR_K_FACTOR': self.iqr_k_spin.value(), # Read IQR spinbox
+            'CALCULATE_LEVEL_SIGNAL': self.calcLevelSignal_sg_check.isChecked() # Read new checkbox
         }
         sp_config = {
             'SIGNAL_FILTER_LOW_HZ': self.filtLow_spin.value(),
@@ -820,7 +830,8 @@ class TuningWindow(QMainWindow):
             'signal_generator': {
                 'SIGNAL_AGGREGATION_METHOD': self.aggMethod_combo.currentText(),
                 'IQR_FILTER_ENABLED': self.iqr_filter_checkbox.isChecked(), # Save IQR state
-                'IQR_K_FACTOR': self.iqr_k_spin.value() # Save IQR k-factor
+                'IQR_K_FACTOR': self.iqr_k_spin.value(), # Save IQR k-factor
+                'CALCULATE_LEVEL_SIGNAL': self.calcLevelSignal_sg_check.isChecked() # Save new setting
             },
             'signal_processor': {
                 'SIGNAL_FILTER_LOW_HZ': self.filtLow_spin.value(),
@@ -850,6 +861,8 @@ class TuningWindow(QMainWindow):
             self.iqr_filter_checkbox.setChecked(iqr_enabled)
             self.iqr_k_spin.setValue(sg_settings.get('IQR_K_FACTOR', 1.5))
             self.iqr_k_spin.setEnabled(iqr_enabled) # Ensure spinbox state matches checkbox
+            # --- Populate Calculate Level Signal checkbox ---
+            self.calcLevelSignal_sg_check.setChecked(sg_settings.get('CALCULATE_LEVEL_SIGNAL', False))
 
             # Populate Signal Processor widgets
             self.filtLow_spin.setValue(sp_settings.get('SIGNAL_FILTER_LOW_HZ', 0.1))
@@ -1026,17 +1039,27 @@ class TuningWindow(QMainWindow):
                 # Pass None for roi_definition as it's not critical for tuner's raw signal recalc
                 # and None for weights as they are not stored in the NPZ.
                 # The SignalGenerator's generate_signal method handles these None values.
-                signal_val, _ = self.signal_generator.generate_signal(
+                # Unpack all three return values, even if raw_level_signal_val is not directly plotted here
+                signal_val, raw_level_signal_val, _points_output = self.signal_generator.generate_signal(
                     old_p_frame, new_p_frame, None, None
                 )
-                recalculated_primary_signal_list.append(signal_val)
-            # Apply inversion (as done in pipeline_manager)
-            self.raw_signal_processed = -np.array(recalculated_primary_signal_list)
-            print(f"Raw signal recalculated using SignalGenerator ({self.signal_generator.aggregation_method}, IQR: {self.signal_generator.iqr_filter_enabled}).")
+                if self.calcLevelSignal_sg_check.isChecked():
+                    # Using the raw_level_signal
+                    recalculated_primary_signal_list.append(raw_level_signal_val if raw_level_signal_val is not None else 0.0)
+                else:
+                    # Using the raw_differential_signal
+                    recalculated_primary_signal_list.append(signal_val)
+
+            if self.calcLevelSignal_sg_check.isChecked():
+                self.raw_signal_processed = np.array(recalculated_primary_signal_list) # No inversion for level signal
+                print(f"Raw signal recalculated as ABSOLUTE LEVEL signal using SignalGenerator.")
+            else:
+                self.raw_signal_processed = -np.array(recalculated_primary_signal_list) # Apply inversion for differential
+                print(f"Raw signal recalculated as DIFFERENTIAL signal using SignalGenerator ({self.signal_generator.aggregation_method}, IQR: {self.signal_generator.iqr_filter_enabled}).")
 
             # --- Handle Compare Mode ---
-            compare_mode = self.compare_agg_checkbox.isChecked()
-            if compare_mode:
+            # Comparison only makes sense if we are NOT showing the absolute level signal as primary
+            if self.compare_agg_checkbox.isChecked() and not self.calcLevelSignal_sg_check.isChecked():
                 # Create a temporary generator with the *opposite* aggregation method
                 # but the same IQR settings
                 primary_method = self.signal_generator.aggregation_method
@@ -1045,13 +1068,14 @@ class TuningWindow(QMainWindow):
                     'SIGNAL_AGGREGATION_METHOD': alt_method,
                     'IQR_FILTER_ENABLED': self.signal_generator.iqr_filter_enabled,
                     'IQR_K_FACTOR': self.signal_generator.iqr_k_factor,
-                    'SIGNAL_MIN_FEATURES_FOR_SIGNAL': self.signal_generator.min_features_for_signal
+                    'SIGNAL_MIN_FEATURES_FOR_SIGNAL': self.signal_generator.min_features_for_signal,
+                    'CALCULATE_LEVEL_SIGNAL': self.signal_generator.calculate_level_signal # Keep same level calc setting
                 }
                 try:
                     alt_signal_generator = SignalGenerator(config=alt_sg_config)
                     recalculated_alt_signal_list = []
                     for old_p_frame, new_p_frame, _ in tracked_data_list:
-                        signal_val_alt, _ = alt_signal_generator.generate_signal(
+                        signal_val_alt, _alt_level, _alt_points = alt_signal_generator.generate_signal(
                             old_p_frame, new_p_frame, None, None
                         )
                         recalculated_alt_signal_list.append(signal_val_alt)
@@ -1073,6 +1097,8 @@ class TuningWindow(QMainWindow):
             # --- This block runs if checkbox is NOT checked ---
             self.raw_signal_processed = self.raw_signal_loaded.copy()
             self.raw_signal_alt_processed = None # No alternative signal
+            # Ensure the "Compare" checkbox is unchecked if "Recalculate" is off, as comparison relies on recalculation
+            # self.compare_agg_checkbox.setChecked(False) # Optional: force uncheck
             # --- Clear histogram ranges if not recalculating ---
             self._clear_histogram_ranges()
             self._live_displacements = None # No live displacements available
@@ -1158,8 +1184,10 @@ class TuningWindow(QMainWindow):
         """Clears stored histogram ranges and potentially resets plot ranges."""
         self.hist_x_range = None
         self.hist_y_range = None
-        # Optionally reset plot ranges or let autoRange take over if re-enabled
-        # self.disp_histogram_widget.enableAutoRange() # Or set to default ranges
+        # Reset to default fixed ranges
+        self.disp_histogram_widget.setXRange(-3, 3, padding=0)
+        self.disp_histogram_widget.setYRange(0, 60, padding=0)
+        self.disp_histogram_widget.getViewBox().disableAutoRange() # Ensure it stays disabled
         self.disp_histogram_curve.clear() # Clear data when ranges are invalid
         print("[Hist Range] Cleared histogram ranges.")
 
