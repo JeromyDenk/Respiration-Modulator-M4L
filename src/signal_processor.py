@@ -1,12 +1,13 @@
 # src/signal_processor.py
 # Phase 4 & 5: Handles signal fusion, filtering (filtfilt/lfilter/ema), peak detection, BPM & phase calculation.
-# MODIFIED: Includes processing for an absolute level signal (drift removal, normalization).
+# MODIFIED: Includes processing for an absolute level signal (drift removal, normalization, adaptive bounds).
 
 import numpy as np
 # Make sure scipy is installed: pip install scipy
 from scipy.signal import butter, filtfilt, lfilter, lfilter_zi, find_peaks
 import collections
 import time # Potentially useful for timestamping peaks if needed
+import math # For inf
 import traceback
 
 # --- EMAFilter Utility ---
@@ -74,6 +75,9 @@ class SignalProcessor:
                 'LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS' (float): Duration for dynamic min/max normalization.
                 'LEVEL_SIGNAL_NORMALIZE_TO_MINUS_ONE_ONE' (bool): True for [-1, 1], False for [0, 1].
                 'LEVEL_SIGNAL_NORMALIZATION_EPSILON' (float): Small value for safe division.
+                'LEVEL_SIGNAL_ADAPTIVE_NORMALIZATION_ENABLED' (bool): Enable adaptive bounds based on clipping.
+                'LEVEL_SIGNAL_ADAPTIVE_HEADROOM_FACTOR' (float): Factor to expand bounds on clip.
+                'LEVEL_SIGNAL_ADAPTIVE_DECAY_FACTOR' (float): Decay factor for adaptive bounds towards window bounds.
                 Defaults are used if config is None or keys are missing.
             sampling_rate (float): The rate at which signal values are generated (samples/sec, e.g., video FPS).
         """
@@ -121,20 +125,29 @@ class SignalProcessor:
         self.processed_level_signal_value = 0.0 # Default value
         self.level_drift_correction_enabled = config.get('LEVEL_SIGNAL_DRIFT_CORRECTION_ENABLED', True) # Default to True if processing level signal
 
-        if self.process_level_signal_enabled:
-            level_light_ema_alpha = config.get('LEVEL_SIGNAL_LIGHT_EMA_ALPHA', None)
+        if self.process_level_signal_enabled: # This check itself might be redundant if 'PROCESS_LEVEL_SIGNAL_ENABLED' is always true
+            level_light_ema_alpha = config.get('LEVEL_SIGNAL_LIGHT_EMA_ALPHA', 0.75) # MODIFIED: Default from None to 0.75
             if level_light_ema_alpha is not None and 0.0 < level_light_ema_alpha < 1.0:
                 self.level_light_ema_filter = EMAFilter(alpha=level_light_ema_alpha)
 
             level_baseline_ema_alpha = config.get('LEVEL_SIGNAL_BASELINE_EMA_ALPHA', 0.002)
             self.level_baseline_ema_filter = EMAFilter(alpha=level_baseline_ema_alpha)
-
-            level_norm_window_seconds = config.get('LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS', 20.0)
+            level_norm_window_seconds = config.get('LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS', 25.0) # MODIFIED: Default from 20.0 to 25.0
             self.level_norm_window_size = 1
             if self.sampling_rate > 0: # Ensure sampling_rate is valid
                 self.level_norm_window_size = max(1, int(level_norm_window_seconds * self.sampling_rate))
             self.level_history_deque = collections.deque(maxlen=self.level_norm_window_size)
         
+        # --- Adaptive Normalization Parameters ---
+        self.adaptive_norm_enabled = config.get('LEVEL_SIGNAL_ADAPTIVE_NORMALIZATION_ENABLED', False)
+        self.adaptive_headroom_factor = config.get('LEVEL_SIGNAL_ADAPTIVE_HEADROOM_FACTOR', 1.05)
+        self.adaptive_decay_factor = config.get('LEVEL_SIGNAL_ADAPTIVE_DECAY_FACTOR', 0.999)
+
+        # --- State Variables for Adaptive Normalization ---
+        self.adaptive_raw_max_level = -math.inf # Use math.inf for cleaner initialization
+        self.adaptive_raw_min_level = math.inf
+        self.no_max_clip_in_previous_cycle = True # Flag for decay logic
+        self.no_min_clip_in_previous_cycle = True # Flag for decay logic
         self.level_normalize_to_minus_one_one = config.get('LEVEL_SIGNAL_NORMALIZE_TO_MINUS_ONE_ONE', True)
         self.level_normalization_epsilon = config.get('LEVEL_SIGNAL_NORMALIZATION_EPSILON', 0.01)
 
@@ -201,6 +214,8 @@ class SignalProcessor:
             norm_win_sec_disp = self.level_norm_window_size / self.sampling_rate if self.sampling_rate > 0 and self.level_norm_window_size is not None else "N/A"
             drift_corr_status = "Enabled" if self.level_drift_correction_enabled else "Disabled"
             print(f"  Level Signal Processing: Enabled (DriftCorr: {drift_corr_status}, LightEMA: {light_ema_alpha_disp}, BaselineEMA: {baseline_ema_alpha_disp}, NormWin: {norm_win_sec_disp:.1f}s)")
+            if self.adaptive_norm_enabled:
+                 print(f"    Adaptive Norm: Enabled (Headroom: {self.adaptive_headroom_factor:.2f}, Decay: {self.adaptive_decay_factor:.4f})")
 
 
     def _calculate_phase(self):
@@ -407,31 +422,79 @@ class SignalProcessor:
                 # 3. Update History for Dynamic Normalization
                 # Ensure level_history_deque exists
                 if self.level_history_deque is None: # Should not happen
-                     print("[SignalProcessor] Error: level_history_deque is None despite being enabled.")
+                     print("[SignalProcessor] Error: level_history_deque is None.")
                      self.processed_level_signal_value = 0.0 # Fallback
                      return
                 self.level_history_deque.append(detrended_signal)
 
+                # --- Adaptive Normalization Logic ---
+                effective_raw_min = 0.0
+                effective_raw_max = 0.0
+                
+                # Get min/max from the rolling window (baseline)
+                if len(self.level_history_deque) > 0: # Should be true after append
+                    window_min = np.min(self.level_history_deque)
+                    window_max = np.max(self.level_history_deque)
+                else: # Fallback if somehow empty
+                    window_min = detrended_signal
+                    window_max = detrended_signal
+
+                if self.adaptive_norm_enabled:
+                    # Decay Adaptive Bounds towards Window Bounds (if no clip in previous cycle)
+                    # This check happens *before* processing the current sample for clipping
+                    if self.no_max_clip_in_previous_cycle and self.adaptive_raw_max_level > window_max:
+                        self.adaptive_raw_max_level = window_max + (self.adaptive_raw_max_level - window_max) * self.adaptive_decay_factor
+                        self.adaptive_raw_max_level = max(self.adaptive_raw_max_level, window_max) # Ensure it doesn't decay below window_max
+
+                    if self.no_min_clip_in_previous_cycle and self.adaptive_raw_min_level < window_min:
+                        self.adaptive_raw_min_level = window_min - (window_min - self.adaptive_raw_min_level) * self.adaptive_decay_factor
+                        self.adaptive_raw_min_level = min(self.adaptive_raw_min_level, window_min) # Ensure it doesn't decay above window_min
+
+                    # Determine Effective Normalization Boundaries (wider of adaptive or window)
+                    effective_raw_max = max(self.adaptive_raw_max_level, window_max)
+                    effective_raw_min = min(self.adaptive_raw_min_level, window_min)
+                else: # Adaptive norm disabled, just use window bounds
+                    effective_raw_max = window_max
+                    effective_raw_min = window_min
+
                 # 4. Dynamic Normalization
-                if len(self.level_history_deque) > 0: # Should always be true after append
-                    min_in_window = np.min(self.level_history_deque)
-                    max_in_window = np.max(self.level_history_deque)
-                    value_range = max_in_window - min_in_window
+                # Use the effective_raw_min and effective_raw_max calculated by the adaptive logic
+                if len(self.level_history_deque) > 0: # Ensure deque is not empty (though it should have been appended to)
+                    value_range = effective_raw_max - effective_raw_min
 
                     if value_range < self.level_normalization_epsilon:
                         # Range too small, output neutral value
                         self.processed_level_signal_value = 0.0 if self.level_normalize_to_minus_one_one else 0.5
                     else:
-                        normalized_0_1 = (detrended_signal - min_in_window) / value_range
-                        
+                        normalized_0_1 = (detrended_signal - effective_raw_min) / value_range
+
                         if self.level_normalize_to_minus_one_one:
                             normalized_val = 2.0 * normalized_0_1 - 1.0
-                            self.processed_level_signal_value = np.clip(normalized_val, -1.0, 1.0)
+                            upper_clip_bound = 1.0
+                            lower_clip_bound = -1.0
                         else:
-                            self.processed_level_signal_value = np.clip(normalized_0_1, 0.0, 1.0)
+                            normalized_val = normalized_0_1
+                            upper_clip_bound = 1.0
+                            lower_clip_bound = 0.0
+
+                        # Detect Clipping and Expand Adaptive Bounds (if enabled)
+                        # This check happens *after* normalization using the effective bounds
+                        if self.adaptive_norm_enabled:
+                            if normalized_val > upper_clip_bound:
+                                # Expand adaptive max based on the detrended value that caused the clip
+                                self.adaptive_raw_max_level = max(self.adaptive_raw_max_level, detrended_signal * self.adaptive_headroom_factor)
+                                self.no_max_clip_in_previous_cycle = False # A clip occurred on the max side
+                            elif normalized_val < lower_clip_bound:
+                                # Expand adaptive min based on the detrended value that caused the clip
+                                min_candidate = detrended_signal - abs(detrended_signal * (self.adaptive_headroom_factor - 1.0)) # Apply footroom
+                                self.adaptive_raw_min_level = min(self.adaptive_raw_min_level, min_candidate)
+                                self.no_min_clip_in_previous_cycle = False # A clip occurred on the min side
+
+                        # Apply hard clip to the final output value for this frame
+                        self.processed_level_signal_value = np.clip(normalized_val, lower_clip_bound, upper_clip_bound)
                 else:
-                    # Not enough history for normalization yet (should not happen if deque is appended to)
-                    self.processed_level_signal_value = 0.0 # Default until history buffer fills
+                    # Should not happen if level_history_deque is appended to
+                    self.processed_level_signal_value = 0.0 if self.level_normalize_to_minus_one_one else 0.5
             # else: raw_level_signal_value is None, so self.processed_level_signal_value holds its last value
             # This means if level signal input stops, the OSC output for level will freeze at the last valid processed value.
         # --- End: Level Signal Processing ---
@@ -492,6 +555,11 @@ class SignalProcessor:
             if self.level_light_ema_filter: self.level_light_ema_filter.reset()
             if self.level_baseline_ema_filter: self.level_baseline_ema_filter.reset() # Should exist if enabled
             # No need to reset self.level_drift_correction_enabled as it's a config param
+            # Reset adaptive normalization state
+            self.adaptive_raw_max_level = -math.inf
+            self.adaptive_raw_min_level = math.inf
+            self.no_max_clip_in_previous_cycle = True
+            if self.level_history_deque: self.level_history_deque.clear() # Should exist if enabled
             if self.level_history_deque: self.level_history_deque.clear() # Should exist if enabled
             self.processed_level_signal_value = 0.0
         print("[SignalProcessor] State reset.")
@@ -518,7 +586,10 @@ if __name__ == '__main__':
         'LEVEL_SIGNAL_BASELINE_EMA_ALPHA': 0.005, # Slower baseline for more drift removal
         'LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS': 15.0,
         'LEVEL_SIGNAL_NORMALIZE_TO_MINUS_ONE_ONE': True,
-        'LEVEL_SIGNAL_NORMALIZATION_EPSILON': 0.01 # Epsilon for normalization range
+        'LEVEL_SIGNAL_NORMALIZATION_EPSILON': 0.01, # Epsilon for normalization range
+        'LEVEL_SIGNAL_ADAPTIVE_NORMALIZATION_ENABLED': True, # Enable adaptive norm for testing
+        'LEVEL_SIGNAL_ADAPTIVE_HEADROOM_FACTOR': 1.1, # Test with 10% headroom
+        'LEVEL_SIGNAL_ADAPTIVE_DECAY_FACTOR': 0.995 # Test with a slightly faster decay
     }
 
     # --- Generate Mock Signal ---

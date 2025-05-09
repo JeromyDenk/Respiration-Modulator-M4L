@@ -1,0 +1,109 @@
+{
+  "profile_name": "Test Profile with Tuned LK Params and 1080p",
+  "description": "Increased norm window with large baseline ema alpha",
+  "enable_raw_data_recording": false,
+  "video_input": {
+    "VIDEO_SOURCE": 0,
+    "VIDEO_WIDTH": 1920,
+    "VIDEO_HEIGHT": 1080,
+    "VIDEO_FPS": 30,
+    "VIDEO_API_PREFERENCE": 1400,
+    "VIDEO_MANUAL_EXPOSURE": true,
+    "VIDEO_EXPOSURE_VALUE": -5,
+    "VIDEO_ISO_VALUE": 1100
+  },
+  "pipeline_manager": {
+    "POSE_DETECTION_FRAME_INTERVAL": 30,
+    "PIPELINE_RECALIBRATION_INTERVAL_SEC": 300
+  },
+  "pose_detector": {
+    "POSE_MODEL_COMPLEXITY": 0,
+    "POSE_STATIC_IMAGE_MODE": false,
+    "POSE_MIN_DETECTION_CONFIDENCE": 0.5,
+    "POSE_MIN_TRACKING_CONFIDENCE": 0.5
+  },
+  "coarse_roi_calculator": {
+    "ROI_STRATEGY": "single_chest_abdomen",
+    "ROI_HORIZONTAL_SCALE_FACTOR": 0.95,
+    "ROI_TOP_PADDING_RATIO": 0.025,
+    "ROI_BOTTOM_PADDING_RATIO": 0.025,
+    "POSE_MIN_LANDMARK_VISIBILITY": 0.6,
+    "ROI_SHOULDER_ONLY_ASPECT_RATIO": 1.8
+  },
+  "evm_processor": {
+    "EVM_ENABLED": true,
+    "EVM_BUFFER_SECONDS": 2.0,
+    "EVM_REFINED_ROI_SIZE_FACTOR": 0.3,
+    "EVM_MIN_BUFFER_FRAMES": 15,
+    "EVM_ROI_SCORING_METHOD": "pixel_variance",
+    "EVM_PYRAMID_LEVELS": 4,
+    "EVM_TEMPORAL_FILTER_LOW_HZ": 0.1,
+    "EVM_TEMPORAL_FILTER_HIGH_HZ": 2.0,
+    "EVM_ALPHA": 50,
+    "EVM_ROI_SELECTION_LEVEL": 3
+  },
+  "feature_tracker": {
+    "OPTICAL_FLOW_PARAMS": {
+      "feature_params": {
+        "maxCorners": 150,
+        "qualityLevel": 0.01,
+        "minDistance": 10,
+        "blockSize": 7
+      },
+      "lk_params": {
+        "winSize": [
+          31,
+          31
+        ],
+        "maxLevel": 3,
+        "criteria": [
+          3,
+          10,
+          0.03
+        ]
+      }
+    },
+    "FEATURE_REDETECT_THRESHOLD": 20,
+    "FEATURE_QUALITY_WEIGHTING_ENABLED": true,
+    "FEATURE_MIN_QUALITY_SCORE": 0.0001
+  },
+  "signal_generator": {
+    "SIGNAL_MIN_FEATURES_FOR_PCA": 3,
+    "SIGNAL_PCA_METHOD": "numpy",
+    "SIGNAL_AGGREGATION_METHOD": "median",
+    "CALCULATE_LEVEL_SIGNAL": true
+  },
+  "signal_processor": {
+    "SIGNAL_BUFFER_SECONDS": 10.0,
+    "SIGNAL_FUSION_STRATEGY": "first",
+    "SIGNAL_FILTER_METHOD": "lfilter",
+    "SIGNAL_FILTER_TYPE": "butterworth",
+    "SIGNAL_FILTER_ORDER": 2,
+    "SIGNAL_FILTER_LOW_HZ": 0.05,
+    "SIGNAL_FILTER_HIGH_HZ": 0.61,
+    "PEAK_DETECT_MIN_HEIGHT": 0.0,
+    "PEAK_DETECT_MIN_DISTANCE_SEC": 0.5,
+    "PEAK_DETECT_PROMINENCE": 0.599,
+    "BPM_AVERAGING_SECONDS": 5.0,
+    "PHASE_SLOPE_WINDOW_MS": 100,
+    "SIGNAL_MIN_FEATURES_FOR_SIGNAL": 0,
+    "SIGNAL_AGGREGATION_METHOD": "median",
+    "PROCESS_LEVEL_SIGNAL_ENABLED": true,
+    "LEVEL_SIGNAL_LIGHT_EMA_ALPHA": 0.6, 
+    "LEVEL_SIGNAL_BASELINE_EMA_ALPHA": 0.05, 
+    "LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS": 9.0,
+    "LEVEL_SIGNAL_NORMALIZE_TO_MINUS_ONE_ONE": false,
+    "LEVEL_SIGNAL_NORMALIZATION_EPSILON": 0.01 
+  },
+  "osc": {
+    "enabled": true,
+    "send_ip": "127.0.0.1",    
+    "send_port": 8888,         
+    "receive_ip": "127.0.0.1", 
+    "receive_port": 8889       
+  },
+  "ui": {
+    "MATPLOTLIB_UI_ENABLED": true,
+    "PLOT_UPDATE_INTERVAL_MS": 100
+  }
+}

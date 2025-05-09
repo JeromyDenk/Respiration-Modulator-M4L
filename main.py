@@ -127,6 +127,7 @@ class PipelineWorker(QObject):
         self.run_timer = QTimer(self) # Timer to drive the run loop
         # --- Revert to DirectConnection for potentially lower latency ---
         self.run_timer.timeout.connect(self.run, Qt.ConnectionType.DirectConnection)
+        self._pending_settings_dict = None # For apply_new_settings deferral
         self._is_transitioning_tracking = False # Add flag
         self.run_timer.setTimerType(Qt.TimerType.PreciseTimer) # Or AccurateTimer
         self._loop_start_time = 0 # To calculate processing time
@@ -647,7 +648,7 @@ class PipelineWorker(QObject):
                 # print(f"[Worker Debug Rec] Pre-send check: recording_enabled={self.recording_enabled}, recorder_queue_exists={self.recorder_queue is not None}, results_exist={results is not None}")
 
                 if can_send_to_recorder:
-                    raw_signal_from_results = results.get('raw_signal')
+                    raw_signal_from_results = results.get('raw_differential_signal')
                     tracked_points_from_results = results.get('tracked_points')
 
                     # --- NEW DETAILED DEBUG ---
@@ -1036,13 +1037,30 @@ class PipelineWorker(QObject):
     @pyqtSlot(dict)
     def apply_new_settings(self, settings_dict):
         """Applies new settings received from the UI."""
-        print(f"[Worker Slot] apply_new_settings called with: {settings_dict}")
+        print(f"[Worker Slot] apply_new_settings requested with: {settings_dict}")
+        self._pending_settings_dict = settings_dict # Store settings for deferred application
+
         if self.state == WorkerState.TRACKING:
             print("[Worker] Stopping tracking before applying new settings.")
             self.set_tracking_active(False)
-            # Give a moment for the state change to potentially take effect
-            time.sleep(0.1)
+            # Defer the rest of the settings application to allow the state change
+            # (including potential recorder stop) to complete without blocking
+            # and to allow the event loop to process.
+            QTimer.singleShot(0, self._proceed_with_settings_application)
+        else:
+            # If not tracking, can proceed more directly, but still good to defer
+            # to ensure it runs in a clean state in the event loop.
+            QTimer.singleShot(0, self._proceed_with_settings_application)
 
+    def _proceed_with_settings_application(self):
+        """Continues the application of new settings after any necessary state changes."""
+        if self._pending_settings_dict is None:
+            print("[Worker] _proceed_with_settings_application called with no pending settings.")
+            return
+        settings_dict = self._pending_settings_dict
+        self._pending_settings_dict = None # Clear pending settings
+
+        print(f"[Worker] Proceeding to apply settings: {settings_dict}")
         # --- Merge Settings ---
         print("[Worker] Merging new settings into current config...")
         try:

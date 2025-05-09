@@ -410,6 +410,12 @@ class MainWindow(QMainWindow):
         self.filtType_combo.addItems(["lfilter", "filtfilt", "ema"]) # Added "ema"
         self.peakProm_spin = QDoubleSpinBox(minimum=0.0, maximum=10.0, singleStep=0.005, value=0.0, decimals=3)
 
+        self.padType_combo = QComboBox()
+        self.padType_combo.addItems(["odd", "even", "constant", "None"]) # Common pad types for filtfilt, None to use default
+        self.padType_combo.setToolTip("Padding type for filtfilt. 'None' uses the default filtfilt padding length calculation.")
+        self.padLen_spin = QSpinBox(minimum=0, maximum=500, singleStep=1, value=50) # 0 could mean auto/default in backend
+        self.padLen_spin.setToolTip("Padding length for filtfilt if padtype is not 'None'. If 0, backend might use default.")
+
         self.emaAlpha_spin = QDoubleSpinBox(minimum=0.01, maximum=1.0, singleStep=0.01, value=0.1, decimals=3)
         self.emaAlpha_spin.setToolTip("Smoothing factor for EMA (0.01-1.0). Smaller is more smoothing.")
         
@@ -448,16 +454,19 @@ class MainWindow(QMainWindow):
         sp_layout.addRow("Filter High:", filtHigh_layout) # Add the HBox layout to the form row
 
         sp_layout.addRow("Filter Method:", self.filtType_combo)
+        sp_layout.addRow("Pad Type (filtfilt):", self.padType_combo)
+        sp_layout.addRow("Pad Length (filtfilt):", self.padLen_spin)
         sp_layout.addRow("EMA Alpha:", self.emaAlpha_spin) # Add EMA Alpha spinbox
         sp_layout.addRow("Peak Prominence:", self.peakProm_spin)
         # self.calcLevelSignal_check might be in a different group (e.g., Signal Generation)
         # For now, let's assume it's accessible for connecting its toggled signal.
         # If it's not part of this group, ensure its signal is connected appropriately.
-        # sp_layout.addRow(self.calcLevelSignal_check) # Example placement
+        sp_layout.addRow(self.calcLevelSignal_check) # Add the checkbox to the layout
 
         # Apply larger font and fixed height to SP input widgets
         for widget in [self.aggMethod_combo, self.filtLow_spin, self.filtHigh_spin,
-                       self.filtType_combo, self.emaAlpha_spin, self.peakProm_spin, self.calcLevelSignal_check]:
+                       self.filtType_combo, self.emaAlpha_spin, self.peakProm_spin, self.calcLevelSignal_check,
+                       self.padType_combo, self.padLen_spin]: # Added pad widgets
             widget.setFont(larger_font)
             widget.setFixedHeight(28) # Optional: Adjust height
 
@@ -473,23 +482,22 @@ class MainWindow(QMainWindow):
         self.levelDriftCorrection_check.setToolTip("Enable subtraction of slow baseline (drift) before normalization.")
         self.levelDriftCorrection_check.setFixedHeight(28)
 
-        self.levelLightEma_check = QCheckBox("Enable Light EMA Smoothing")
+        self.levelLightEma_check = QCheckBox("Enable Initial Light EMA Smoothing")
         self.levelLightEma_check.setFont(larger_font)
-        self.levelLightEma_check.setToolTip("Apply a light EMA filter to the raw level signal before further processing.")
+        self.levelLightEma_check.setToolTip("Apply a light EMA filter to the raw level signal before baseline removal and normalization. Helps reduce noise.")
         self.levelLightEma_check.setFixedHeight(28)
-        self.levelLightEmaAlpha_spin = QDoubleSpinBox(minimum=0.01, maximum=0.99, singleStep=0.01, value=0.6, decimals=2)
+        self.levelLightEmaAlpha_spin = QDoubleSpinBox(minimum=0.01, maximum=0.99, singleStep=0.01, value=0.75, decimals=2) # MODIFIED: Default value from 0.6 to 0.75
         self.levelLightEmaAlpha_spin.setFont(larger_font)
-        self.levelLightEmaAlpha_spin.setToolTip("Alpha for light EMA (0.01-0.99). Higher is less smoothing.")
+        self.levelLightEmaAlpha_spin.setToolTip("Alpha for initial light EMA (0.01-0.99). Higher alpha = less smoothing. Lower alpha = more smoothing.")
         self.levelLightEmaAlpha_spin.setFixedHeight(28)
 
         self.levelBaselineEmaAlpha_spin = QDoubleSpinBox(minimum=0.0001, maximum=0.1, singleStep=0.0001, value=0.002, decimals=4)
         self.levelBaselineEmaAlpha_spin.setFont(larger_font)
         self.levelBaselineEmaAlpha_spin.setToolTip("Alpha for slow baseline tracking EMA (0.0001-0.1). Smaller is slower.")
         self.levelBaselineEmaAlpha_spin.setFixedHeight(28)
-
-        self.levelNormWindow_spin = QDoubleSpinBox(minimum=1.0, maximum=60.0, singleStep=1.0, value=15.0, decimals=1)
+        self.levelNormWindow_spin = QDoubleSpinBox(minimum=1.0, maximum=60.0, singleStep=1.0, value=25.0, decimals=1) # MODIFIED: Default value from 15.0 to 25.0
         self.levelNormWindow_spin.setFont(larger_font)
-        self.levelNormWindow_spin.setToolTip("Normalization window duration in seconds (1-60s).")
+        self.levelNormWindow_spin.setToolTip("Normalization window duration in seconds (1-60s). Longer window provides more stable normalization over varying breath amplitudes but adapts slower to overall signal level changes.")
         self.levelNormWindow_spin.setFixedHeight(28)
 
         self.levelNormToMinusOne_check = QCheckBox("Normalize to [-1, 1]")
@@ -503,6 +511,19 @@ class MainWindow(QMainWindow):
         self.levelNormEpsilon_spin.setToolTip("Epsilon for normalization range (1e-6 to 1.0).")
         self.levelNormEpsilon_spin.setFixedHeight(28)
 
+        self.levelAdaptiveNorm_check = QCheckBox("Enable Adaptive Bounds")
+        self.levelAdaptiveNorm_check.setFont(larger_font)
+        self.levelAdaptiveNorm_check.setToolTip("Enable adaptive expansion and decay of normalization bounds based on signal clipping.")
+        self.levelAdaptiveNorm_check.setFixedHeight(28)
+        self.levelAdaptiveHeadroom_spin = QDoubleSpinBox(minimum=1.0, maximum=1.5, singleStep=0.01, value=1.05, decimals=2)
+        self.levelAdaptiveHeadroom_spin.setFont(larger_font)
+        self.levelAdaptiveHeadroom_spin.setToolTip("Factor to expand bounds on clip (e.g., 1.05 for 5% headroom). Active if adaptive bounds enabled.")
+        self.levelAdaptiveHeadroom_spin.setFixedHeight(28)
+        self.levelAdaptiveDecay_spin = QDoubleSpinBox(minimum=0.9000, maximum=0.9999, singleStep=0.0001, value=0.9990, decimals=4)
+        self.levelAdaptiveDecay_spin.setFont(larger_font)
+        self.levelAdaptiveDecay_spin.setToolTip("Decay factor per frame for adaptive bounds towards window bounds (closer to 1 = slower decay). Active if adaptive bounds enabled.")
+        self.levelAdaptiveDecay_spin.setFixedHeight(28)
+
         lsp_layout.addRow(self.levelDriftCorrection_check)
         lsp_layout.addRow(self.levelLightEma_check)
         lsp_layout.addRow("Level Light EMA Alpha:", self.levelLightEmaAlpha_spin)
@@ -510,6 +531,9 @@ class MainWindow(QMainWindow):
         lsp_layout.addRow("Level Norm. Window (s):", self.levelNormWindow_spin)
         lsp_layout.addRow(self.levelNormToMinusOne_check)
         lsp_layout.addRow("Level Norm. Epsilon:", self.levelNormEpsilon_spin)
+        lsp_layout.addRow(self.levelAdaptiveNorm_check)
+        lsp_layout.addRow("Adaptive Headroom:", self.levelAdaptiveHeadroom_spin)
+        lsp_layout.addRow("Adaptive Decay:", self.levelAdaptiveDecay_spin)
         
         # Add this new group to your main settings layout, e.g., settings_layout
         # settings_layout.addWidget(self.lsp_group) # Or wherever it fits best
@@ -521,14 +545,16 @@ class MainWindow(QMainWindow):
         self.calcLevelSignal_check.toggled.connect(self._update_level_signal_widgets_state_main_ui)
         self.levelDriftCorrection_check.toggled.connect(self._update_level_signal_widgets_state_main_ui)
         self.levelLightEma_check.toggled.connect(self._update_level_signal_widgets_state_main_ui)
+        self.levelAdaptiveNorm_check.toggled.connect(self._update_level_signal_widgets_state_main_ui) # Connect new checkbox
         self._update_level_signal_widgets_state_main_ui() # Initial state
 
         settings_row_layout.addWidget(sp_group) # Add group to the horizontal layout
 
         # Connect signal for filter type change to update widget states
-        self.filtType_combo.currentIndexChanged.connect(self._update_filter_param_widgets_state_main_ui)
+        self.filtType_combo.currentTextChanged.connect(self._update_filter_param_widgets_state_main_ui) # Connect to text changed for clarity
         # Call it once to set initial state
         self._update_filter_param_widgets_state_main_ui()
+
 
         # Add the row containing both group boxes to the main settings layout
         settings_main_layout.addLayout(settings_row_layout)
@@ -547,24 +573,16 @@ class MainWindow(QMainWindow):
         apply_button_layout.addStretch(1)
         settings_main_layout.addLayout(apply_button_layout) # Add below the groups row
 
-        bottom_main_layout.addWidget(self.settings_main_group)
-
-        # Status Bar
-        self.statusBar = QStatusBar()
-        self.setStatusBar(self.statusBar)
-
-        # --- Apply Larger Font to Group Box Titles explicitly ---
-        title_font = QFont(larger_font)
-        title_font.setBold(True) # Optional: Make titles bold for group boxes
-        status_group.setFont(title_font)
-        overlays_group.setFont(title_font)
-        # ft_group.setFont(title_font) # Already set above
-        # sp_group.setFont(title_font) # Already set above
-        profile_group.setFont(title_font)
+        # Remove redundant addWidget for sp_group. It's already added to settings_row_layout.
+        # settings_row_layout.addWidget(sp_group) # This was at line 492, already added at 475
 
         # --- Call toggle settings AFTER all widgets are created ---
         # This ensures the settings group exists before trying to hide/show it.
         self._toggle_settings_visibility(self.settings_toggle_button.isChecked())
+
+        # --- Status Bar ---
+        self.statusBar = QStatusBar()
+        self.setStatusBar(self.statusBar)
 
     @pyqtSlot()
     def _toggle_main_plot_source(self):
@@ -1001,8 +1019,8 @@ class MainWindow(QMainWindow):
                 'EMA_ALPHA': self.emaAlpha_spin.value(), # Add EMA Alpha
                 # Convert 0.0 from spinbox back to None for peak detection logic (already handled)
                 'PEAK_DETECT_PROMINENCE': self.peakProm_spin.value() if self.peakProm_spin.value() > 1e-6 else None,
-                'PAD_TYPE': self.padType_combo.currentText(),
-                'PAD_LEN': self.padLen_spin.value(),
+                'PAD_TYPE': self.padType_combo.currentText() if self.padType_combo.currentText() != "None" else None, # Pass None if "None" selected
+                'PAD_LEN': self.padLen_spin.value() if self.padType_combo.currentText() != "None" else None, # Pass None if padtype is "None"
                 # Level signal processing settings for SignalProcessor
                 'PROCESS_LEVEL_SIGNAL_ENABLED': True, # Permanently enabled
                 'LEVEL_SIGNAL_DRIFT_CORRECTION_ENABLED': self.levelDriftCorrection_check.isChecked(),
@@ -1010,8 +1028,10 @@ class MainWindow(QMainWindow):
                 'LEVEL_SIGNAL_BASELINE_EMA_ALPHA': self.levelBaselineEmaAlpha_spin.value(),
                 'LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS': self.levelNormWindow_spin.value(),
                 'LEVEL_SIGNAL_NORMALIZE_TO_MINUS_ONE_ONE': self.levelNormToMinusOne_check.isChecked(),
-                'LEVEL_SIGNAL_NORMALIZATION_EPSILON': self.levelNormEpsilon_spin.value()
-
+                'LEVEL_SIGNAL_NORMALIZATION_EPSILON': self.levelNormEpsilon_spin.value(),
+                'LEVEL_SIGNAL_ADAPTIVE_NORMALIZATION_ENABLED': self.levelAdaptiveNorm_check.isChecked(),
+                'LEVEL_SIGNAL_ADAPTIVE_HEADROOM_FACTOR': self.levelAdaptiveHeadroom_spin.value(),
+                'LEVEL_SIGNAL_ADAPTIVE_DECAY_FACTOR': self.levelAdaptiveDecay_spin.value()
             }
         }
 
@@ -1245,19 +1265,30 @@ class MainWindow(QMainWindow):
             # For permanent enable, ensure it's checked. It's already set and disabled in _init_ui.
             # This line primarily ensures that if a profile *somehow* had it as False, UI still shows True.
             self.calcLevelSignal_check.setChecked(True) 
+
+            # Populate Pad Type and Pad Length
+            pad_type = sp_settings.get('PAD_TYPE', 'odd') # Default to 'odd'
+            self.padType_combo.setCurrentText(str(pad_type) if pad_type is not None else "None") # Handle None from config
+            self.padLen_spin.setValue(sp_settings.get('PAD_LEN', 50) if sp_settings.get('PAD_LEN') is not None else 0) # Default to 50, or 0 if None
             
             # Populate Level Signal Processing widgets (from SignalProcessor settings)
             self.levelDriftCorrection_check.setChecked(sp_settings.get('LEVEL_SIGNAL_DRIFT_CORRECTION_ENABLED', True))
-            light_ema_alpha = sp_settings.get('LEVEL_SIGNAL_LIGHT_EMA_ALPHA', None)
+            light_ema_alpha = sp_settings.get('LEVEL_SIGNAL_LIGHT_EMA_ALPHA', 0.75) # MODIFIED: Default fallback to 0.75
             self.levelLightEma_check.setChecked(light_ema_alpha is not None)
-            self.levelLightEmaAlpha_spin.setValue(light_ema_alpha if light_ema_alpha is not None else 0.6)
+            self.levelLightEmaAlpha_spin.setValue(light_ema_alpha if light_ema_alpha is not None else 0.75) # MODIFIED: Default fallback to 0.75
             self.levelBaselineEmaAlpha_spin.setValue(sp_settings.get('LEVEL_SIGNAL_BASELINE_EMA_ALPHA', 0.002))
-            self.levelNormWindow_spin.setValue(sp_settings.get('LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS', 15.0))
+            self.levelNormWindow_spin.setValue(sp_settings.get('LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS', 25.0)) # MODIFIED: Default fallback to 25.0
             self.levelNormToMinusOne_check.setChecked(sp_settings.get('LEVEL_SIGNAL_NORMALIZE_TO_MINUS_ONE_ONE', True))
             self.levelNormEpsilon_spin.setValue(sp_settings.get('LEVEL_SIGNAL_NORMALIZATION_EPSILON', 0.01))
+            # Populate new adaptive normalization widgets
+            self.levelAdaptiveNorm_check.setChecked(sp_settings.get('LEVEL_SIGNAL_ADAPTIVE_NORMALIZATION_ENABLED', False)) # Default to False
+            self.levelAdaptiveHeadroom_spin.setValue(sp_settings.get('LEVEL_SIGNAL_ADAPTIVE_HEADROOM_FACTOR', 1.05))
+            self.levelAdaptiveDecay_spin.setValue(sp_settings.get('LEVEL_SIGNAL_ADAPTIVE_DECAY_FACTOR', 0.999))
+
 
             # Update enabled state of filter params based on loaded method
             self._update_level_signal_widgets_state_main_ui() # Update for level signal group
+            self._update_filter_param_widgets_state_main_ui() # Update for filter params
         except Exception as e: print(f"Error populating settings widgets: {e}"); traceback.print_exc(); self.statusBar.showMessage("Error loading settings into UI.", 3000); QMessageBox.warning(self, "Settings Error", f"Could not fully populate settings widgets:\n{e}")
 
     def _update_filter_param_widgets_state_main_ui(self):
@@ -1265,18 +1296,24 @@ class MainWindow(QMainWindow):
         selected_method = self.filtType_combo.currentText()
 
         is_butter_filtfilt = selected_method in ['lfilter', 'filtfilt']
+        is_filtfilt_only = selected_method == 'filtfilt'
         is_ema = selected_method == 'ema'
 
         # Butterworth/filtfilt specific params
         self.filtLow_spin.setEnabled(is_butter_filtfilt)
         self.filtHigh_spin.setEnabled(is_butter_filtfilt)
+
+        # Pad Type and Pad Length are specific to 'filtfilt'
+        self.padType_combo.setEnabled(is_filtfilt_only)
+        # Enable padLen_spin only if filtfilt is selected AND padType is not "None"
+        pad_type_selected = self.padType_combo.currentText()
+        self.padLen_spin.setEnabled(is_filtfilt_only and pad_type_selected != "None")
+
         # Assuming filter order and type are fixed for now. If they were widgets:
         # self.filterOrder_spin.setEnabled(is_butter_filtfilt)
         # self.filterButterType_combo.setEnabled(is_butter_filtfilt)
-
         # EMA specific params
         self.emaAlpha_spin.setEnabled(is_ema)
-
     def _update_level_signal_widgets_state_main_ui(self):
         """Enables/disables level signal parameter widgets in the main UI."""
         # Group is enabled if SignalGenerator is set to calculate level signal
@@ -1287,11 +1324,16 @@ class MainWindow(QMainWindow):
             drift_correction_ui_enabled = self.levelDriftCorrection_check.isChecked()
             light_ema_ui_enabled = self.levelLightEma_check.isChecked()
 
+            adaptive_norm_enabled = self.levelAdaptiveNorm_check.isChecked()
+
             self.levelDriftCorrection_check.setEnabled(True) # Always enabled if group is enabled
             self.levelLightEma_check.setEnabled(True)      # Always enabled if group is enabled
             self.levelLightEmaAlpha_spin.setEnabled(light_ema_ui_enabled)
             self.levelBaselineEmaAlpha_spin.setEnabled(drift_correction_ui_enabled)
             # Other widgets (norm window, norm target, epsilon) are always enabled if group is enabled
+            self.levelAdaptiveNorm_check.setEnabled(True) # The checkbox itself is always enabled if group is
+            self.levelAdaptiveHeadroom_spin.setEnabled(adaptive_norm_enabled)
+            self.levelAdaptiveDecay_spin.setEnabled(adaptive_norm_enabled)
             self.levelNormWindow_spin.setEnabled(True)
             self.levelNormToMinusOne_check.setEnabled(True)
             self.levelNormEpsilon_spin.setEnabled(True)
