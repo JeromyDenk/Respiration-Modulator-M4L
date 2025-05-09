@@ -85,8 +85,8 @@ class PipelineManager:
              return { # Return default structure
                 # Assuming PHASE_UNKNOWN is available or handle import
                 'bpm': 0.0, 'bpm_valid': False, 'phase': 0, # Use 0 if PHASE_UNKNOWN import fails
-                'current_rois': [], 'landmarks': None,
-                'filtered_signal_history': [], 'raw_signal_history': [],
+                'current_rois': [], 
+                'landmarks': None, # PoseDetector not used in this manager
                 'peak_indices': [], 'processing_time': 0,
                 # Add default timing structure
                 'timing_ms': {
@@ -94,7 +94,10 @@ class PipelineManager:
                     'signal_processor': 0.0, 'total_pipeline': 0.0
                 },
                 'recalibration_run_this_frame': False, 'recalibration_succeeded': False,
-                'frame_count': self.frame_count, 'tracked_points': None # Add tracked_points key
+                'frame_count': self.frame_count, 
+                'tracked_points': None,
+                'processed_level_signal': 0.0, # Default for level signal
+                'raw_level_signal': None
              }
 
         start_time = time.time()
@@ -192,12 +195,10 @@ class PipelineManager:
 
         # --- 4. Signal Processing ---
         # SignalProcessor expects a list of raw signal values.
-        # raw_signal_value here is the (inverted) raw_differential_signal
-        differential_signals_for_processor = [raw_signal_value if raw_signal_value is not None else 0.0]
         try:
             t_start_sp = time.perf_counter()
             self.signal_processor.process_signal_values(
-                differential_signals_for_processor,
+                # Pass only the raw_level_signal_value
                 raw_level_signal_value=raw_level_signal if 'raw_level_signal' in locals() else None # Pass the actual raw_level_signal
             )
             t_end_sp = time.perf_counter()
@@ -207,10 +208,8 @@ class PipelineManager:
         # --- 5. Gather Results ---
         bpm, bpm_valid = self.signal_processor.get_bpm()
         phase = self.signal_processor.get_phase()
-        filtered_signal_history = self.signal_processor.get_filtered_signal_buffer()
-        raw_signal_history = self.signal_processor.get_raw_signal_buffer()
         peak_indices = self.signal_processor.get_last_peak_indices()
-        latest_filtered_value = self.signal_processor.get_latest_filtered_value() # <<< Get latest value
+        # latest_filtered_value, raw_signal_history, filtered_signal_history are removed
         
         # Get the processed level signal if it was enabled
         processed_level_signal = 0.0
@@ -224,12 +223,10 @@ class PipelineManager:
 
         results = {
             'bpm': bpm, 'bpm_valid': bpm_valid, 'phase': phase,
-            'current_rois': self.current_rois, 'landmarks': None,
-            'filtered_signal_history': filtered_signal_history,
-            'raw_signal_history': raw_signal_history,
+            'current_rois': self.current_rois, 
+            'landmarks': None, # PoseDetector not used in this manager
             'peak_indices': peak_indices,
             'processing_time': processing_time,
-            'latest_filtered_value': latest_filtered_value, # <<< Add value to results
 
             # --- Add timing results (in milliseconds) ---
             'timing_ms': {
@@ -241,7 +238,7 @@ class PipelineManager:
             'recalibration_run_this_frame': False, 'recalibration_succeeded': False,
             'frame_count': self.frame_count,
             'tracked_points': current_tracked_points,    # Points from feature tracker
-            'raw_differential_signal': raw_signal_value, # The (inverted) raw differential signal value
+            # 'raw_differential_signal': raw_signal_value, # Removed as differential signal is phased out
             'raw_level_signal': raw_level_signal if 'raw_level_signal' in locals() else None, # The raw level signal
             'processed_level_signal': processed_level_signal, # The processed level signal
             'feature_tracker_status': status_from_tracker, # Status from feature tracker

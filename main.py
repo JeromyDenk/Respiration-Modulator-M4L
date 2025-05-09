@@ -734,42 +734,27 @@ class PipelineWorker(QObject):
                     #     print(f"[Timing (ms)] Grab: {t_frame_grab_ms:.1f}, "
                     #           f"FT: {pipeline_timings.get('feature_tracker', 0):.1f}, "
                     #           f"SG: {pipeline_timings.get('signal_generator', 0):.1f}, "
-                    #           f"SP: {pipeline_timings.get('signal_processor', 0):.1f}, "
-                    #           f"Draw: {t_draw_overlays_ms:.1f}, "
+                    #           f"SP: {pipeline_timings.get('signal_processor', 0):.1f}, " # type: ignore
+                    #           f"Draw: {t_draw_overlays_ms:.1f}, " # type: ignore
                     #           f"PipeTotal: {pipeline_timings.get('total_pipeline', 0):.1f}, "
                     #           f"CycleTotal: {t_worker_cycle_ms:.1f}")
                     # --- END PRINT STATEMENT ---
 
                     # --- Emit latest filtered value for visualizer ---
-                    latest_val = results.get('latest_filtered_value', 0.0)
-                    self.new_filtered_signal_value.emit(latest_val)
-                    # ---
-
-                    # Emit plot data and status (adjust based on your reverted SignalProcessor interface)
-                    # Example using get methods from the reverted pipeline_manager context:
-                    bpm, bpm_valid = self.pipeline_manager.signal_processor.get_bpm()
-                    phase = self.pipeline_manager.signal_processor.get_phase()
-                    plot_data = self.pipeline_manager.signal_processor.get_filtered_signal_buffer()
-                    # Or if results dict contains them directly (less likely in reverted code):
-                    # plot_data = results.get('filtered_signal_history', [])
-                    # bpm = results.get('bpm', 0.0)
-                    # valid = results.get('bpm_valid', False)
-                    # phase = results.get('phase', SignalProcessor.PHASE_UNKNOWN)
+                    # MODIFIED: Use processed_level_signal for the visualizer
+                    latest_val_for_visualizer = results.get('processed_level_signal', 0.0) if results else 0.0
+                    self.new_filtered_signal_value.emit(latest_val_for_visualizer)
 
                     # --- Emit the full results dictionary ---
                     if self.osc_manager and results:
-                        # Assuming 'latest_filtered_value' is the "filtered differential signal"
-                        # And also using it as a placeholder for "processed level signal"
-                        # You might need to adjust the keys based on what `pipeline_manager` actually returns.
-                        filtered_diff_signal = results.get('latest_filtered_value', 0.0)
                         # If you have a distinct "processed level signal" in results, use its key here:
                         # e.g., processed_lvl_signal = results.get('processed_level_signal_key', 0.0)
                         processed_lvl_signal = results.get('processed_level_signal', 0.0) # Use the actual key
 
                         current_phase_int = self.pipeline_manager.signal_processor.get_phase()
                         breath_phase_str = self.phase_map.get(current_phase_int, "unknown")
-
-                        self.osc_manager.send_filtered_differential_signal(filtered_diff_signal)
+                        
+                        # Removed sending of filtered_differential_signal as it's no longer processed
                         self.osc_manager.send_processed_level_signal(processed_lvl_signal)
                         self.osc_manager.send_breath_phase(breath_phase_str)
 
@@ -779,7 +764,11 @@ class PipelineWorker(QObject):
                     self.new_pipeline_results.emit(results) # <<< EMIT THE FULL RESULTS
 
                     # self.new_plot_data.emit(plot_data) # Redundant, UI uses new_pipeline_results
-                    self.new_status.emit(bpm, bpm_valid, phase)
+                    # Get BPM and phase from results if available, otherwise from signal_processor directly
+                    bpm_res = results.get('bpm', 0.0)
+                    bpm_valid_res = results.get('bpm_valid', False)
+                    phase_res = results.get('phase', SignalProcessor.PHASE_UNKNOWN)
+                    self.new_status.emit(bpm_res, bpm_valid_res, phase_res)
                 else: # Handle case where pipeline_manager.process_frame returned None
                     # self.new_plot_data.emit([]) # Redundant
                     self.new_status.emit(0.0, False, SignalProcessor.PHASE_UNKNOWN)

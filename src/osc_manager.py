@@ -61,7 +61,6 @@ class OSCManager:
         elif not self.server_thread:
             logger.warning("OSC server was not initialized. Cannot start.")
 
-
     def stop_server(self):
         """Stops the OSC server if it is running."""
         if self.server:
@@ -102,10 +101,6 @@ class OSCManager:
         else:
             logger.warning(f"OSC client not available. Cannot send message: {address} {value}")
 
-
-    def send_filtered_differential_signal(self, value: float):
-        """Sends the filtered differential signal."""
-        self.send_message("/breath/signal/differential", float(value))
 
     def send_processed_level_signal(self, value: float):
         """Sends the processed level signal."""

@@ -204,98 +204,11 @@ Optional Sigmoid Normalization (e.g., Logistic Function)
 
 - tqdm for loading cv2 video feed
 
-# Adaptive Normalization (Adaptive Clipping Reduction)
+# Adaptive Normalization (Adaptive Clipping Reduction) - DONE
 
-Okay, this sounds like a solid direction to make your level signal normalization more robust and responsive! Let's break down the implementation of this adaptive normalization strategy into a step-by-step plan.
+# BPM and Phase Detection - DONE
 
-We'll aim for a system where:
 
-A rolling window provides a baseline min/max for normalization.
-Clipping events immediately expand dedicated "adaptive" min/max boundaries with a configurable headroom.
-These adaptive boundaries slowly decay back towards the rolling window's min/max if no further clipping occurs, preventing a single large event from permanently skewing the normalization.
-The effective boundaries used for normalization at any point are the "widest" of the rolling window and the (decayed) adaptive boundaries.
-Here's a plan:
+- Show description of profile tooltip on hover
 
-Phase 1: UI Enhancements (Adding Controls)
-
-Goal: Add new UI elements in main_window.py to control the adaptive normalization parameters.
-
-File: c:\Software Development\Respiration Modulator M4L\src\ui\main_window.py
-
-Step 1.1: Add New Widgets in _init_ui
-
-In the "Level Signal Processing" group (self.lsp_group), add:
-self.levelAdaptiveNorm_check = QCheckBox("Enable Adaptive Bounds")
-self.levelAdaptiveHeadroom_spin = QDoubleSpinBox() (e.g., min 1.0, max 1.5, step 0.01, default 1.05, decimals 2, tooltip: "Factor to expand bounds on clip (e.g., 1.05 for 5% headroom).")
-self.levelAdaptiveDecay_spin = QDoubleSpinBox() (e.g., min 0.9, max 0.9999, step 0.001, default 0.999, decimals 4, tooltip: "Decay factor per frame for adaptive bounds towards window bounds (closer to 1 = slower decay).")
-Set their fonts and fixed heights like other widgets in that group.
-Add them to the lsp_layout (the QFormLayout of self.lsp_group).
-Step 1.2: Update populate_settings_widgets
-
-Load values for these new widgets from the sp_settings dictionary (e.g., 'LEVEL_SIGNAL_ADAPTIVE_NORMALIZATION_ENABLED', 'LEVEL_SIGNAL_ADAPTIVE_HEADROOM_FACTOR', 'LEVEL_SIGNAL_ADAPTIVE_DECAY_FACTOR').
-Provide sensible default values if the keys are not found in the loaded profile.
-Step 1.3: Update _gather_and_apply_settings
-
-Collect the values from these new widgets and add them to the settings['signal_processor'] dictionary with corresponding keys.
-Step 1.4: Update _update_level_signal_widgets_state_main_ui
-
-The new headroom and decay spinboxes should only be enabled if self.levelAdaptiveNorm_check is checked AND the main level signal processing group is enabled.
-Connect self.levelAdaptiveNorm_check.toggled to _update_level_signal_widgets_state_main_ui to refresh enabled states.
-Phase 2: Backend Implementation (Conceptual - in SignalProcessor)
-
-Goal: Modify the level signal normalization logic in your backend (SignalProcessor class, likely in signal_processor.py).
-
-File: (Assumed) signal_processor.py
-
-Step 2.1: Initialize New State Variables
-
-In your SignalProcessor.__init__ or when settings are applied:
-self.adaptive_raw_max_level = -np.inf (or from calibration)
-self.adaptive_raw_min_level = np.inf (or from calibration)
-self.no_max_clip_in_previous_cycle = True
-self.no_min_clip_in_previous_cycle = True
-Store the new config parameters: adaptive_enabled, headroom_factor, decay_factor.
-Step 2.2: Modify Normalization Logic (per frame/sample)
-
-a. Get Rolling Window Min/Max:
-
-Calculate window_min and window_max from your level_signal_buffer (as currently done for LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS).
-b. Decay Adaptive Bounds (if enabled and no recent clip for that bound):
-
-If adaptive_enabled and self.no_max_clip_in_previous_cycle and self.adaptive_raw_max_level > window_max: self.adaptive_raw_max_level = window_max + (self.adaptive_raw_max_level - window_max) * self.config['decay_factor'] self.adaptive_raw_max_level = max(self.adaptive_raw_max_level, window_max) (don't decay below window)
-Similarly for self.adaptive_raw_min_level using window_min.
-Reset self.no_max_clip_in_previous_cycle = True and self.no_min_clip_in_previous_cycle = True for the current cycle.
-c. Determine Effective Normalization Boundaries:
-
-effective_raw_max = max(self.adaptive_raw_max_level, window_max)
-effective_raw_min = min(self.adaptive_raw_min_level, window_min)
-If adaptive_enabled is False, then effective_raw_max = window_max and effective_raw_min = window_min.
-d. Normalize the Current Raw Level Value:
-
-Use effective_raw_min and effective_raw_max to normalize the current_raw_level_value (to [0,1] or [-1,1] as per existing config).
-e. Detect Clipping and Expand Adaptive Bounds (if enabled):
-
-If adaptive_enabled and the normalized_signal clips:
-If normalized_signal > upper_clip_bound: self.adaptive_raw_max_level = max(self.adaptive_raw_max_level, current_raw_level_value * self.config['headroom_factor']) self.no_max_clip_in_previous_cycle = False
-If normalized_signal < lower_clip_bound: min_candidate = current_raw_level_value - abs(current_raw_level_value * (self.config['headroom_factor'] - 1.0)) (or current_raw_level_value / self.config['headroom_factor'] if always positive) self.adaptive_raw_min_level = min(self.adaptive_raw_min_level, min_candidate) self.no_min_clip_in_previous_cycle = False
-Apply hard clipping to normalized_signal for the current output.
-f. Update Rolling Buffer: Add current_raw_level_value to your level_signal_buffer.
-
-Phase 3: Calibration Considerations (Future Enhancement / Initial Values)
-
-Goal: Think about how to best initialize adaptive_raw_min_level and adaptive_raw_max_level.
-Step 3.1: Simple Initialization: Start with -np.inf and np.inf. The first few values processed by the rolling window, or the first clip, will set them.
-Step 3.2: (Future) Manual Calibration Step:
-Add a "Calibrate Level Signal" button to the UI.
-When clicked, the user takes a max inhale and max exhale.
-The backend captures the raw min/max during this period and uses them to initialize adaptive_raw_min_level and adaptive_raw_max_level. This would provide excellent starting points.
-Phase 4: Testing and Tuning
-
-Goal: Ensure the system behaves as expected and fine-tune parameters.
-Step 4.1: Observe Behavior:
-Watch the "Processed Absolute Level Signal" plot.
-Test with varying breath depths: shallow, normal, very deep, held breaths.
-Confirm that clipping expands the range and that the range slowly adapts back down if breathing becomes shallower.
-Step 4.2: Tune Parameters:
-Adjust "Adaptive Headroom Factor": Too low might not prevent subsequent clips on the same breath; too high might make the range jump excessively.
-Adjust "Adaptive Bound Decay Factor": Too close to 1 makes decay very slow (long memory of peaks); too far from 1 makes it decay quickly (less memory, more reliant on the rolling window).
+- Add feature quality threshold to settings UI
