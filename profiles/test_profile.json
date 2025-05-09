@@ -88,12 +88,12 @@
     "SIGNAL_MIN_FEATURES_FOR_SIGNAL": 0,
     "SIGNAL_AGGREGATION_METHOD": "median"
   },
-  "osc_sender": {
-    "OSC_IP_ADDRESS": "127.0.0.1",
-    "OSC_PORT": 8888,
-    "OSC_BPM_ADDRESS": "/respiration/bpm",
-    "OSC_PHASE_ADDRESS": "/respiration/phase",
-    "OSC_VALIDITY_ADDRESS": "/respiration/valid"
+  "osc": {
+    "enabled": true,
+    "send_ip": "127.0.0.1",    
+    "send_port": 8888,         
+    "receive_ip": "127.0.0.1", 
+    "receive_port": 8889       
   },
   "ui": {
     "MATPLOTLIB_UI_ENABLED": true,

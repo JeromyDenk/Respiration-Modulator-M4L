@@ -592,11 +592,11 @@ class MainWindow(QMainWindow):
             data = self.pipeline_data
         
         # This print is crucial. What does it say when you toggle?
-        print(f"[UI Update Debug] === _update_gui_elements CALLED. Plotting level: {self.main_plot_shows_level}. Tracking: {self.tracking_active} ===")
-        if data is not None:
-            print(f"[UI Update Debug] Available keys in data: {list(data.keys())}")
-        else:
-            print("[UI Update Debug] self.pipeline_data is None.")
+        # print(f"[UI Update Debug] === _update_gui_elements CALLED. Plotting level: {self.main_plot_shows_level}. Tracking: {self.tracking_active} ===")
+        # if data is not None:
+        #     print(f"[UI Update Debug] Available keys in data: {list(data.keys())}")
+        # else:
+        #     print("[UI Update Debug] self.pipeline_data is None.")
 
         # Update video feed (assuming this part is okay)
         annotated_frame = data.get("annotated_frame") if data is not None else None
@@ -624,7 +624,7 @@ class MainWindow(QMainWindow):
 
         # Update signal plot
         if self.main_plot_shows_level:
-            print("[UI Update Debug] BRANCH: Plotting LEVEL signal.")
+            # print("[UI Update Debug] BRANCH: Plotting LEVEL signal.")
             self.plot_widget.setTitle("Processed Absolute Level Signal", size=f'{int(self.font().pointSize()*1.05)}pt')
             self.plot_widget.setLabel('bottom', 'Samples (Rolling Window)')
             self.plot_curve.setPen(self.plot_curve_level_pen) # RED PEN
@@ -635,7 +635,7 @@ class MainWindow(QMainWindow):
 
             # Fetch PROCESSED level signal
             processed_level_signal_value = data.get("processed_level_signal") if data is not None else None
-            print(f"[UI Update Debug - LEVEL] Fetched 'processed_level_signal': {processed_level_signal_value}")
+            # print(f"[UI Update Debug - LEVEL] Fetched 'processed_level_signal': {processed_level_signal_value}")
 
             self.plot_data_buffer = np.roll(self.plot_data_buffer, -1) # Roll buffer and ASSIGN BACK
             if processed_level_signal_value is not None and np.isfinite(processed_level_signal_value): # Ensure value is finite
@@ -643,31 +643,31 @@ class MainWindow(QMainWindow):
             else:
                 # If no new valid level signal value, roll in a NaN to represent missing data.
                 self.plot_data_buffer[-1] = np.nan
-                print(f"[UI Update Debug - LEVEL] 'processed_level_signal' is {processed_level_signal_value}. Inserted NaN into buffer.")
+                # print(f"[UI Update Debug - LEVEL] 'processed_level_signal' is {processed_level_signal_value}. Inserted NaN into buffer.")
             
             x_axis_raw_level_plot = np.arange(len(self.plot_data_buffer)) # Indices for the rolling buffer
-            print(f"[UI Update Debug - LEVEL] Plotting self.plot_data_buffer (last 5): {self.plot_data_buffer[-5:]}")
+            # print(f"[UI Update Debug - LEVEL] Plotting self.plot_data_buffer (last 5): {self.plot_data_buffer[-5:]}")
             self.plot_curve.setData(x_axis_raw_level_plot, self.plot_data_buffer)
 
             # Set Y-axis range based on normalization target
             normalize_to_minus_one_one = data.get('level_normalize_to_minus_one_one', True) if data is not None else True
             if normalize_to_minus_one_one:
                 self.plot_widget.setYRange(-1.1, 1.1, padding=0)
-                print("[UI Update Debug - LEVEL] Y-Axis set to [-1.1, 1.1].")
+                # print("[UI Update Debug - LEVEL] Y-Axis set to [-1.1, 1.1].")
             else:
                 self.plot_widget.setYRange(-0.1, 1.1, padding=0)
-                print("[UI Update Debug - LEVEL] Y-Axis set to [-0.1, 1.1].")
+                # print("[UI Update Debug - LEVEL] Y-Axis set to [-0.1, 1.1].")
             self.plot_widget.getPlotItem().getViewBox().disableAutoRange(axis=pg.ViewBox.YAxis) # Ensure Y-axis auto-range is off
  
         else: # Show Filtered Differential Signal
-            print("[UI Update Debug] BRANCH: Plotting DIFFERENTIAL signal.")
+            # print("[UI Update Debug] BRANCH: Plotting DIFFERENTIAL signal.")
             self.plot_widget.setTitle("Filtered Differential Signal", size=f'{int(self.font().pointSize()*1.05)}pt')
             self.plot_widget.setLabel('bottom', 'Time (s)')
             self.plot_curve.setPen(self.plot_curve_differential_pen) # BLUE PEN
             
             processed_signal_buffer = data.get("filtered_signal_history", []) if data is not None else []
             current_sampling_rate = data.get("sampling_rate", 30.0) if data is not None else 30.0 # Get sampling rate from data
-            print(f"[UI Update Debug - DIFF] Fetched 'filtered_signal_history' length: {len(processed_signal_buffer)}, Using SR: {current_sampling_rate}")
+            # print(f"[UI Update Debug - DIFF] Fetched 'filtered_signal_history' length: {len(processed_signal_buffer)}, Using SR: {current_sampling_rate}")
 
             # Enable auto-range for both X and Y for the differential signal
             self.plot_widget.getPlotItem().getViewBox().enableAutoRange(axis=pg.ViewBox.XYAxes) 
@@ -675,13 +675,13 @@ class MainWindow(QMainWindow):
                 # Use current_sampling_rate fetched from data dictionary
                 if current_sampling_rate > 0: 
                     time_axis = np.arange(len(processed_signal_buffer)) / current_sampling_rate
-                    print(f"[UI Update Debug - DIFF] Plotting differential buffer (last 5): {processed_signal_buffer[-5:] if len(processed_signal_buffer) >=5 else processed_signal_buffer}")
+                    # print(f"[UI Update Debug - DIFF] Plotting differential buffer (last 5): {processed_signal_buffer[-5:] if len(processed_signal_buffer) >=5 else processed_signal_buffer}")
                     self.plot_curve.setData(time_axis, processed_signal_buffer)
                 else:
-                    print("[UI Update Debug - DIFF] Cannot plot differential: PipelineManager or sampling rate invalid. Clearing plot.")
+                    # print("[UI Update Debug - DIFF] Cannot plot differential: PipelineManager or sampling rate invalid. Clearing plot.")
                     self.plot_curve.clear()
             else:
-                print("[UI Update Debug - DIFF] Differential buffer empty or invalid. Clearing plot.")
+                # print("[UI Update Debug - DIFF] Differential buffer empty or invalid. Clearing plot.")
                 self.plot_curve.clear()
         
         # Update BPM display and status bar (only if data was available)

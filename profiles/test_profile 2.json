@@ -92,15 +92,15 @@
     "LEVEL_SIGNAL_LIGHT_EMA_ALPHA": 0.6, 
     "LEVEL_SIGNAL_BASELINE_EMA_ALPHA": 0.002, 
     "LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS": 4.0,
-    "LEVEL_SIGNAL_NORMALIZE_TO_MINUS_ONE_ONE": true,
+    "LEVEL_SIGNAL_NORMALIZE_TO_MINUS_ONE_ONE": false,
     "LEVEL_SIGNAL_NORMALIZATION_EPSILON": 0.01 
   },
-  "osc_sender": {
-    "OSC_IP_ADDRESS": "127.0.0.1",
-    "OSC_PORT": 8888,
-    "OSC_BPM_ADDRESS": "/respiration/bpm",
-    "OSC_PHASE_ADDRESS": "/respiration/phase",
-    "OSC_VALIDITY_ADDRESS": "/respiration/valid"
+  "osc": {
+    "enabled": true,
+    "send_ip": "127.0.0.1",    
+    "send_port": 8888,         
+    "receive_ip": "127.0.0.1", 
+    "receive_port": 8889       
   },
   "ui": {
     "MATPLOTLIB_UI_ENABLED": true,

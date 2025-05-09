@@ -55,6 +55,7 @@ try:
     from feature_tracker import FeatureTracker # Import for re-init
     from signal_generator import SignalGenerator # Import for re-init
 
+    from osc_manager import OSCManager # <<< Import OSCManager
     from raw_data_recorder import DataRecorder # Import the recorder class
 except ImportError as e:
     print(f"Fatal Error: Failed to import necessary modules from 'src' or 'src/ui': {e}")
@@ -135,6 +136,16 @@ class PipelineWorker(QObject):
         self.recorder_process = None
         self.recorder_queue = None
         self.recorder_stop_event = None
+
+        # --- OSC Manager ---
+        self.osc_manager = None
+
+        # --- Breath Phase Mapping ---
+        self.phase_map = {
+            SignalProcessor.PHASE_INHALE: "inhaling",
+            SignalProcessor.PHASE_EXHALE: "exhaling",
+            SignalProcessor.PHASE_UNKNOWN: "neutral"
+        }
     def _load_config(self):
         """Loads the configuration from the specified file path."""
         config = {}
@@ -157,6 +168,34 @@ class PipelineWorker(QObject):
             raise # Re-raise to signal the failure upwards
         return self.current_config
 
+    def _initialize_osc_manager(self):
+        """Initializes the OSCManager based on the current configuration."""
+        if self.osc_manager:
+            print("[Worker] Stopping existing OSC manager before re-initializing.")
+            self.osc_manager.stop_server()
+            self.osc_manager = None
+
+        osc_config = self.current_config.get("osc", {})
+        if osc_config.get("enabled", False):
+            try:
+                send_ip = osc_config["send_ip"]
+                send_port = int(osc_config["send_port"])
+                receive_ip = osc_config["receive_ip"]
+                receive_port = int(osc_config["receive_port"])
+
+                self.osc_manager = OSCManager(
+                    send_ip=send_ip,
+                    send_port=send_port,
+                    receive_ip=receive_ip,
+                    receive_port=receive_port
+                )
+                self.osc_manager.start_server()
+                print("[Worker] OSCManager initialized and server started.")
+            except KeyError as e:
+                print(f"[Worker] OSC configuration missing key: {e}. OSC features will be disabled.")
+            except Exception as e:
+                print(f"[Worker] Failed to initialize OSCManager: {e}. OSC features will be disabled.")
+                self.osc_manager = None
     def _load_config_from_path(self, file_path):
         """Loads a configuration dictionary from a given file path."""
         config = {}
@@ -179,6 +218,7 @@ class PipelineWorker(QObject):
         try:
             # Load configuration first
             config = self._load_config()
+            self._initialize_osc_manager() # Initialize OSC after config is loaded
             video_config = config.get("video_input", {})
 
             # Release existing video input if any
@@ -716,6 +756,25 @@ class PipelineWorker(QObject):
                     # phase = results.get('phase', SignalProcessor.PHASE_UNKNOWN)
 
                     # --- Emit the full results dictionary ---
+                    if self.osc_manager and results:
+                        # Assuming 'latest_filtered_value' is the "filtered differential signal"
+                        # And also using it as a placeholder for "processed level signal"
+                        # You might need to adjust the keys based on what `pipeline_manager` actually returns.
+                        filtered_diff_signal = results.get('latest_filtered_value', 0.0)
+                        # If you have a distinct "processed level signal" in results, use its key here:
+                        # e.g., processed_lvl_signal = results.get('processed_level_signal_key', 0.0)
+                        processed_lvl_signal = results.get('processed_level_signal', 0.0) # Use the actual key
+
+                        current_phase_int = self.pipeline_manager.signal_processor.get_phase()
+                        breath_phase_str = self.phase_map.get(current_phase_int, "unknown")
+
+                        self.osc_manager.send_filtered_differential_signal(filtered_diff_signal)
+                        self.osc_manager.send_processed_level_signal(processed_lvl_signal)
+                        self.osc_manager.send_breath_phase(breath_phase_str)
+
+                        # You can log M4L connection status if needed:
+                        # print(f"M4L Connected: {self.osc_manager.get_m4l_connection_status()}")
+
                     self.new_pipeline_results.emit(results) # <<< EMIT THE FULL RESULTS
 
                     # self.new_plot_data.emit(plot_data) # Redundant, UI uses new_pipeline_results
@@ -757,6 +816,9 @@ class PipelineWorker(QObject):
         if self.pose_detector:
             self.pose_detector.close()
             print("  PoseDetector closed.")
+        if self.osc_manager:
+            self.osc_manager.stop_server()
+            print("  OSCManager stopped.")
         print("[Worker] Resource cleanup finished.")
         # --- Stop Recorder Process ---
         self._stop_recorder_process()
@@ -908,6 +970,9 @@ class PipelineWorker(QObject):
         self.config_path = new_config_path # Store the new path
         self.current_config = new_config   # Adopt the new config
         self.recording_enabled = self.current_config.get("enable_raw_data_recording", False) # Update recording flag
+
+        # Re-initialize OSC manager with new config
+        self._initialize_osc_manager()
 
         if video_settings_changed:
             print("[Worker] Video settings changed. Full re-initialization required.")
