@@ -90,7 +90,7 @@ class PipelineWorker(QObject):
     """
     # --- Signals ---
     new_frame_ready = pyqtSignal(np.ndarray)
-    new_plot_data = pyqtSignal(list)
+    # new_plot_data = pyqtSignal(list) # Redundant, covered by new_pipeline_results
     new_status = pyqtSignal(float, bool, int)
     new_filtered_signal_value = pyqtSignal(float) # <<< Signal for the visualizer
     processing_error = pyqtSignal(str)
@@ -98,6 +98,7 @@ class PipelineWorker(QObject):
     setup_finished = pyqtSignal(bool, str)
     component_initialized = pyqtSignal(str, bool, str)
     current_settings_signal = pyqtSignal(dict) # Emit initial/current settings to UI
+    new_pipeline_results = pyqtSignal(dict) # <<< ADD THIS SIGNAL DEFINITION
     profile_saved_signal = pyqtSignal(str, bool, str) # file_path, success, message
 
     # --- ADDED: Timer for scheduling run loop ---
@@ -575,7 +576,7 @@ class PipelineWorker(QObject):
                 #       f"CycleTotal: {t_worker_cycle_ms:.1f}")
 
                 self.new_frame_ready.emit(processed_frame)
-                self.new_plot_data.emit([]) # No plot data in preview
+                # self.new_plot_data.emit([]) # No plot data in preview
                 self.new_status.emit(0.0, False, SignalProcessor.PHASE_UNKNOWN) # No status in preview
 
             elif self.state == WorkerState.TRACKING:
@@ -714,10 +715,13 @@ class PipelineWorker(QObject):
                     # valid = results.get('bpm_valid', False)
                     # phase = results.get('phase', SignalProcessor.PHASE_UNKNOWN)
 
-                    self.new_plot_data.emit(plot_data)
+                    # --- Emit the full results dictionary ---
+                    self.new_pipeline_results.emit(results) # <<< EMIT THE FULL RESULTS
+
+                    # self.new_plot_data.emit(plot_data) # Redundant, UI uses new_pipeline_results
                     self.new_status.emit(bpm, bpm_valid, phase)
                 else: # Handle case where pipeline_manager.process_frame returned None
-                    self.new_plot_data.emit([])
+                    # self.new_plot_data.emit([]) # Redundant
                     self.new_status.emit(0.0, False, SignalProcessor.PHASE_UNKNOWN)
 
             # --- Calculate next schedule time ---
@@ -1067,7 +1071,7 @@ if __name__ == "__main__":
     # --- Connect Signals and Slots ---
     # Worker -> UI
     worker.new_frame_ready.connect(main_window.update_webcam_feed)
-    worker.new_plot_data.connect(main_window.update_plot)
+    # worker.new_plot_data.connect(main_window.update_plot) # OBSOLETE: update_plot removed from MainWindow
     worker.new_status.connect(main_window.update_status_labels)
     worker.new_filtered_signal_value.connect(visualizer_window.update_signal) # <<< Connect visualizer
     worker.processing_error.connect(main_window.show_error_message)
@@ -1075,6 +1079,9 @@ if __name__ == "__main__":
     worker.component_initialized.connect(main_window.handle_component_initialized)
     worker.current_settings_signal.connect(main_window.populate_settings_widgets) # New connection
     worker.profile_saved_signal.connect(main_window.handle_profile_saved)
+    # --- Ensure this connection is robust ---
+    worker.new_pipeline_results.connect(main_window.handle_worker_output, Qt.ConnectionType.QueuedConnection)
+    print("[Main Setup] Connected worker.new_pipeline_results to main_window.handle_worker_output")
 
     # UI -> Worker
     # --- MODIFIED: Connect directly to wrapper slots ---
@@ -1110,7 +1117,7 @@ if __name__ == "__main__":
 
     # --- Start Application ---
     main_window.show()
-    visualizer_window.show() # <<< Show the visualizer window
+    # visualizer_window.show() # <<< Show the visualizer window
     # Start the worker thread's event loop
     # Use QTimer for a slightly delayed start to ensure the main event loop is running
     QTimer.singleShot(100, worker_thread.start)

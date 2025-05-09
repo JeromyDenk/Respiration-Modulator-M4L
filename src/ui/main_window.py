@@ -18,8 +18,8 @@ try:
         QSizePolicy, QStatusBar, QSpinBox, QDoubleSpinBox, QFormLayout, QSpacerItem # Added widgets
     )
     # Added QPainter, QRectF
-    from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer, QRect, QPoint, QRectF
-    # Added QPainter
+    from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer, QRect, QPoint, QRectF, pyqtSlot # Added pyqtSlot
+    # Added QPainter, pyqtSlot
     from PyQt6.QtGui import QImage, QPixmap, QFont, QPalette, QColor, QPainter
 except ImportError:
     print("Fatal Error: PyQt6 not found. Please install it (e.g., pip install PyQt6)")
@@ -127,9 +127,11 @@ class MainWindow(QMainWindow):
 
         self.config_file = config_file # Store initial config path
         self.profiles_dir = profiles_dir # Store profiles directory path
-        self.plot_data_buffer = np.zeros(PLOT_BUFFER_SIZE)
+        # Initialize plot_data_buffer with NaNs for a cleaner initial plot for level signal
+        self.plot_data_buffer = np.full(PLOT_BUFFER_SIZE, np.nan) 
         self._pose_overlay_state_before_tracking = True # Default to True
         self.tracking_active = False # UI's understanding of tracking state
+        self.main_plot_shows_level = False # New state for main plot content
 
         self._init_ui()
         self._load_and_populate_initial_settings()
@@ -187,9 +189,21 @@ class MainWindow(QMainWindow):
         self.plot_widget.setLabel('left', 'Amplitude')
         self.plot_widget.setLabel('bottom', 'Samples')
         self.plot_widget.setTitle('Filtered Signal', size=f'{int(new_point_size*1.05)}pt')
-        self.plot_curve = self.plot_widget.plot(pen=pg.mkPen('b', width=2))
+        # Define pens for different plot types
+        self.plot_curve_differential_pen = pg.mkPen('b', width=2) # Blue for differential
+        self.plot_curve_level_pen = pg.mkPen('r', width=2)      # Red for level
+        self.plot_curve = self.plot_widget.plot(pen=self.plot_curve_differential_pen) # Start with differential
         # Add plot widget to the top layout with a lower stretch factor
         top_layout.addWidget(self.plot_widget, 2) # Give less vertical space to plot initially
+
+        # --- Button to toggle main plot source ---
+        self.toggle_main_plot_button = QPushButton("Show Processed Level Signal")
+        self.toggle_main_plot_button.setToolTip("Toggles the main signal plot between Filtered Differential and Processed Level signal.")
+        # --- ENSURE THIS CONNECTION IS PRESENT AND NOT COMMENTED OUT ---
+        self.toggle_main_plot_button.clicked.connect(self._toggle_main_plot_source)
+        # ---
+        self.toggle_main_plot_button.setFixedHeight(28)
+        top_layout.addWidget(self.toggle_main_plot_button) # Add it below the plot
 
         # --- Bottom Section: Controls ---
         self.bottom_controls_widget = QWidget()
@@ -398,10 +412,16 @@ class MainWindow(QMainWindow):
 
         self.emaAlpha_spin = QDoubleSpinBox(minimum=0.01, maximum=1.0, singleStep=0.01, value=0.1, decimals=3)
         self.emaAlpha_spin.setToolTip("Smoothing factor for EMA (0.01-1.0). Smaller is more smoothing.")
-
+        
+        # Checkbox for Calculate Level Signal (from SignalGenerator config)
+        # This might already exist if you followed previous steps for signal_generator.py
+        # If not, it should be here or in a "Signal Generation" group.
+        # For this diff, I'll assume it's self.calcLevelSignal_sg_check (like in tuner)
         # --- ADDED: Checkbox for Calculate Level Signal ---
         self.calcLevelSignal_check = QCheckBox("Calculate Absolute Level Signal")
         self.calcLevelSignal_check.setToolTip("Enable calculation of a raw signal representing absolute vertical position (proxy for lung fullness).")
+        self.calcLevelSignal_check.setChecked(True) # Permanently enabled: Set to True
+        self.calcLevelSignal_check.setEnabled(False) # Permanently enabled: Disable user interaction
 
         # Add tooltips (already present)
         # Note: filtType_combo tooltip might need updating if it only mentions lfilter/filtfilt
@@ -430,13 +450,78 @@ class MainWindow(QMainWindow):
         sp_layout.addRow("Filter Method:", self.filtType_combo)
         sp_layout.addRow("EMA Alpha:", self.emaAlpha_spin) # Add EMA Alpha spinbox
         sp_layout.addRow("Peak Prominence:", self.peakProm_spin)
-        sp_layout.addRow(self.calcLevelSignal_check) # Add the new checkbox
+        # self.calcLevelSignal_check might be in a different group (e.g., Signal Generation)
+        # For now, let's assume it's accessible for connecting its toggled signal.
+        # If it's not part of this group, ensure its signal is connected appropriately.
+        # sp_layout.addRow(self.calcLevelSignal_check) # Example placement
 
         # Apply larger font and fixed height to SP input widgets
         for widget in [self.aggMethod_combo, self.filtLow_spin, self.filtHigh_spin,
                        self.filtType_combo, self.emaAlpha_spin, self.peakProm_spin, self.calcLevelSignal_check]:
             widget.setFont(larger_font)
             widget.setFixedHeight(28) # Optional: Adjust height
+
+        # --- Level Signal Processing Settings (New Group) ---
+        self.lsp_group = QGroupBox("Level Signal Processing") # Store as instance member
+        self.lsp_group.setFont(larger_font)
+        # --- ADDED: Explicit border style to match other groups ---
+        self.lsp_group.setStyleSheet("QGroupBox { border: 1px solid gray; margin-top: 0.5em; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px 0 3px; }")
+        lsp_layout = QFormLayout(self.lsp_group)
+
+        self.levelDriftCorrection_check = QCheckBox("Enable Drift Correction")
+        self.levelDriftCorrection_check.setFont(larger_font)
+        self.levelDriftCorrection_check.setToolTip("Enable subtraction of slow baseline (drift) before normalization.")
+        self.levelDriftCorrection_check.setFixedHeight(28)
+
+        self.levelLightEma_check = QCheckBox("Enable Light EMA Smoothing")
+        self.levelLightEma_check.setFont(larger_font)
+        self.levelLightEma_check.setToolTip("Apply a light EMA filter to the raw level signal before further processing.")
+        self.levelLightEma_check.setFixedHeight(28)
+        self.levelLightEmaAlpha_spin = QDoubleSpinBox(minimum=0.01, maximum=0.99, singleStep=0.01, value=0.6, decimals=2)
+        self.levelLightEmaAlpha_spin.setFont(larger_font)
+        self.levelLightEmaAlpha_spin.setToolTip("Alpha for light EMA (0.01-0.99). Higher is less smoothing.")
+        self.levelLightEmaAlpha_spin.setFixedHeight(28)
+
+        self.levelBaselineEmaAlpha_spin = QDoubleSpinBox(minimum=0.0001, maximum=0.1, singleStep=0.0001, value=0.002, decimals=4)
+        self.levelBaselineEmaAlpha_spin.setFont(larger_font)
+        self.levelBaselineEmaAlpha_spin.setToolTip("Alpha for slow baseline tracking EMA (0.0001-0.1). Smaller is slower.")
+        self.levelBaselineEmaAlpha_spin.setFixedHeight(28)
+
+        self.levelNormWindow_spin = QDoubleSpinBox(minimum=1.0, maximum=60.0, singleStep=1.0, value=15.0, decimals=1)
+        self.levelNormWindow_spin.setFont(larger_font)
+        self.levelNormWindow_spin.setToolTip("Normalization window duration in seconds (1-60s).")
+        self.levelNormWindow_spin.setFixedHeight(28)
+
+        self.levelNormToMinusOne_check = QCheckBox("Normalize to [-1, 1]")
+        self.levelNormToMinusOne_check.setFont(larger_font)
+        self.levelNormToMinusOne_check.setChecked(True)
+        self.levelNormToMinusOne_check.setToolTip("If checked, normalizes to [-1, 1]. If unchecked, normalizes to [0, 1].")
+        self.levelNormToMinusOne_check.setFixedHeight(28)
+
+        self.levelNormEpsilon_spin = QDoubleSpinBox(minimum=1e-6, maximum=1.0, singleStep=1e-3, value=0.01, decimals=6)
+        self.levelNormEpsilon_spin.setFont(larger_font)
+        self.levelNormEpsilon_spin.setToolTip("Epsilon for normalization range (1e-6 to 1.0).")
+        self.levelNormEpsilon_spin.setFixedHeight(28)
+
+        lsp_layout.addRow(self.levelDriftCorrection_check)
+        lsp_layout.addRow(self.levelLightEma_check)
+        lsp_layout.addRow("Level Light EMA Alpha:", self.levelLightEmaAlpha_spin)
+        lsp_layout.addRow("Level Baseline EMA Alpha:", self.levelBaselineEmaAlpha_spin)
+        lsp_layout.addRow("Level Norm. Window (s):", self.levelNormWindow_spin)
+        lsp_layout.addRow(self.levelNormToMinusOne_check)
+        lsp_layout.addRow("Level Norm. Epsilon:", self.levelNormEpsilon_spin)
+        
+        # Add this new group to your main settings layout, e.g., settings_layout
+        # settings_layout.addWidget(self.lsp_group) # Or wherever it fits best
+        # Add to settings_main_layout (the QVBoxLayout of self.settings_main_group)
+        settings_main_layout.addWidget(self.lsp_group)
+
+        # Connect signals for enabling/disabling level processing widgets
+        # Assuming self.calcLevelSignal_check is the checkbox from SignalGenerator settings
+        self.calcLevelSignal_check.toggled.connect(self._update_level_signal_widgets_state_main_ui)
+        self.levelDriftCorrection_check.toggled.connect(self._update_level_signal_widgets_state_main_ui)
+        self.levelLightEma_check.toggled.connect(self._update_level_signal_widgets_state_main_ui)
+        self._update_level_signal_widgets_state_main_ui() # Initial state
 
         settings_row_layout.addWidget(sp_group) # Add group to the horizontal layout
 
@@ -481,6 +566,145 @@ class MainWindow(QMainWindow):
         # This ensures the settings group exists before trying to hide/show it.
         self._toggle_settings_visibility(self.settings_toggle_button.isChecked())
 
+    @pyqtSlot()
+    def _toggle_main_plot_source(self):
+        """Toggles the source for the main signal plot and forces a UI update."""
+        self.main_plot_shows_level = not self.main_plot_shows_level
+        print(f"[UI Toggle Debug] main_plot_shows_level is NOW: {self.main_plot_shows_level}")
+        self._update_main_plot_button_text()
+        # RE-ADD direct call to _update_gui_elements().
+        self._update_gui_elements() # Force GUI update to reflect new plot source
+        
+        # If we switched to level view, but level signal processing is actually off,
+        # the plot might be misleading (e.g. flat zero).
+        # The button's enabled state should ideally reflect if level signal is available.
+        # This is handled in _update_level_signal_widgets_state_main_ui.
+        # Forcing an update here ensures the plot reflects the current state immediately.
+
+
+    def _update_main_plot_button_text(self):
+        self.toggle_main_plot_button.setText("Show Filtered Differential" if self.main_plot_shows_level else "Show Processed Level Signal")
+
+    def _update_gui_elements(self):
+        """Updates GUI elements with data from the pipeline."""
+        data = None
+        if hasattr(self, 'pipeline_data') and self.pipeline_data is not None:
+            data = self.pipeline_data
+        
+        # This print is crucial. What does it say when you toggle?
+        print(f"[UI Update Debug] === _update_gui_elements CALLED. Plotting level: {self.main_plot_shows_level}. Tracking: {self.tracking_active} ===")
+        if data is not None:
+            print(f"[UI Update Debug] Available keys in data: {list(data.keys())}")
+        else:
+            print("[UI Update Debug] self.pipeline_data is None.")
+
+        # Update video feed (assuming this part is okay)
+        annotated_frame = data.get("annotated_frame") if data is not None else None
+        if annotated_frame is not None:
+            try:
+                if annotated_frame.ndim == 3 and annotated_frame.shape[2] == 3:
+                    h, w, ch = annotated_frame.shape
+                    bytes_per_line = ch * w
+                    qt_image = QImage(bytes(annotated_frame.data), w, h, bytes_per_line, QImage.Format.Format_BGR888)
+                elif annotated_frame.ndim == 2:
+                    h, w = annotated_frame.shape
+                    bytes_per_line = w
+                    qt_image = QImage(bytes(annotated_frame.data), w, h, bytes_per_line, QImage.Format.Format_Grayscale8)
+                else:
+                    qt_image = None
+                if qt_image and not qt_image.isNull():
+                    self.webcam_label.update_frame(qt_image)
+                else:
+                    self.webcam_label.clear_frame()
+            except Exception as e_img:
+                print(f"Error updating video feed: {e_img}")
+                self.webcam_label.clear_frame()
+        # If annotated_frame is None, the logic within the 'if annotated_frame is not None:' block
+        # (specifically, qt_image being None or image.isNull()) will handle clearing the frame.
+
+        # Update signal plot
+        if self.main_plot_shows_level:
+            print("[UI Update Debug] BRANCH: Plotting LEVEL signal.")
+            self.plot_widget.setTitle("Processed Absolute Level Signal", size=f'{int(self.font().pointSize()*1.05)}pt')
+            self.plot_widget.setLabel('bottom', 'Samples (Rolling Window)')
+            self.plot_curve.setPen(self.plot_curve_level_pen) # RED PEN
+
+            # For processed level signal, Y-axis is fixed based on normalization, X-axis is fixed for buffer
+            self.plot_widget.getPlotItem().getViewBox().disableAutoRange(axis=pg.ViewBox.XAxis)
+            self.plot_widget.setXRange(0, PLOT_BUFFER_SIZE - 1, padding=0.02)
+
+            # Fetch PROCESSED level signal
+            processed_level_signal_value = data.get("processed_level_signal") if data is not None else None
+            print(f"[UI Update Debug - LEVEL] Fetched 'processed_level_signal': {processed_level_signal_value}")
+
+            self.plot_data_buffer = np.roll(self.plot_data_buffer, -1) # Roll buffer and ASSIGN BACK
+            if processed_level_signal_value is not None and np.isfinite(processed_level_signal_value): # Ensure value is finite
+                self.plot_data_buffer[-1] = float(processed_level_signal_value) # Ensure it's a float
+            else:
+                # If no new valid level signal value, roll in a NaN to represent missing data.
+                self.plot_data_buffer[-1] = np.nan
+                print(f"[UI Update Debug - LEVEL] 'processed_level_signal' is {processed_level_signal_value}. Inserted NaN into buffer.")
+            
+            x_axis_raw_level_plot = np.arange(len(self.plot_data_buffer)) # Indices for the rolling buffer
+            print(f"[UI Update Debug - LEVEL] Plotting self.plot_data_buffer (last 5): {self.plot_data_buffer[-5:]}")
+            self.plot_curve.setData(x_axis_raw_level_plot, self.plot_data_buffer)
+
+            # Set Y-axis range based on normalization target
+            normalize_to_minus_one_one = data.get('level_normalize_to_minus_one_one', True) if data is not None else True
+            if normalize_to_minus_one_one:
+                self.plot_widget.setYRange(-1.1, 1.1, padding=0)
+                print("[UI Update Debug - LEVEL] Y-Axis set to [-1.1, 1.1].")
+            else:
+                self.plot_widget.setYRange(-0.1, 1.1, padding=0)
+                print("[UI Update Debug - LEVEL] Y-Axis set to [-0.1, 1.1].")
+            self.plot_widget.getPlotItem().getViewBox().disableAutoRange(axis=pg.ViewBox.YAxis) # Ensure Y-axis auto-range is off
+ 
+        else: # Show Filtered Differential Signal
+            print("[UI Update Debug] BRANCH: Plotting DIFFERENTIAL signal.")
+            self.plot_widget.setTitle("Filtered Differential Signal", size=f'{int(self.font().pointSize()*1.05)}pt')
+            self.plot_widget.setLabel('bottom', 'Time (s)')
+            self.plot_curve.setPen(self.plot_curve_differential_pen) # BLUE PEN
+            
+            processed_signal_buffer = data.get("filtered_signal_history", []) if data is not None else []
+            current_sampling_rate = data.get("sampling_rate", 30.0) if data is not None else 30.0 # Get sampling rate from data
+            print(f"[UI Update Debug - DIFF] Fetched 'filtered_signal_history' length: {len(processed_signal_buffer)}, Using SR: {current_sampling_rate}")
+
+            # Enable auto-range for both X and Y for the differential signal
+            self.plot_widget.getPlotItem().getViewBox().enableAutoRange(axis=pg.ViewBox.XYAxes) 
+            if isinstance(processed_signal_buffer, (list, np.ndarray)) and len(processed_signal_buffer) > 0:
+                # Use current_sampling_rate fetched from data dictionary
+                if current_sampling_rate > 0: 
+                    time_axis = np.arange(len(processed_signal_buffer)) / current_sampling_rate
+                    print(f"[UI Update Debug - DIFF] Plotting differential buffer (last 5): {processed_signal_buffer[-5:] if len(processed_signal_buffer) >=5 else processed_signal_buffer}")
+                    self.plot_curve.setData(time_axis, processed_signal_buffer)
+                else:
+                    print("[UI Update Debug - DIFF] Cannot plot differential: PipelineManager or sampling rate invalid. Clearing plot.")
+                    self.plot_curve.clear()
+            else:
+                print("[UI Update Debug - DIFF] Differential buffer empty or invalid. Clearing plot.")
+                self.plot_curve.clear()
+        
+        # Update BPM display and status bar (only if data was available)
+        if data:
+            bpm = data.get("bpm", 0.0)
+            bpm_is_valid = data.get("bpm_valid", False)
+            phase = data.get("phase", SignalProcessor.PHASE_UNKNOWN) 
+            self.update_status_labels(bpm, bpm_is_valid, phase)
+
+            phase_str = "Inhale" if phase == SignalProcessor.PHASE_INHALE else "Exhale" if phase == SignalProcessor.PHASE_EXHALE else "---"
+            current_plot_value_display = 0.0
+            if self.main_plot_shows_level:
+                current_plot_value_display = self.plot_data_buffer[-1]
+            elif 'processed_signal_buffer' in locals() and isinstance(processed_signal_buffer, (list, np.ndarray)) and len(processed_signal_buffer) > 0:
+                 current_plot_value_display = processed_signal_buffer[-1]
+            
+            status_bar_text = f"BPM: {bpm:.1f} ({'Valid' if bpm_is_valid else 'Invalid'}) | Phase: {phase_str} | Plot Val: {current_plot_value_display:.2f}"
+            if hasattr(self, 'statusBar') and self.statusBar:
+                self.statusBar.showMessage(status_bar_text)
+        else: # If no data, clear status or set to default
+            self.update_status_labels(0.0, False, SignalProcessor.PHASE_UNKNOWN)
+            if hasattr(self, 'statusBar') and self.statusBar:
+                self.statusBar.showMessage("Status: N/A (No data)")
 
     def _load_and_populate_initial_settings(self):
         """Loads settings from the initial config file (if provided) and populates widgets."""
@@ -702,11 +926,14 @@ class MainWindow(QMainWindow):
             # "Show Features" remains as is (likely checked from when tracking started)
             self._emit_overlay_settings() # Emit settings after restoring/enabling pose checkbox
             # --- End UI Changes ---
-            print("[UI] Stop Tracking signal emitted.")
+            # --- MODIFIED: Clear plot_data_buffer on stop ---
+            self.plot_data_buffer.fill(np.nan) # Clear level signal buffer for next start
+            self.pipeline_data = None # Clear pipeline data to signal no data available
             self.stop_tracking_signal.emit()
             # Reset plot and status when stopped
-            self.update_plot([])
+            # self.update_plot([]) # Old direct call, now handled by _update_gui_elements
             self.update_status_labels(0, False, SignalProcessor.PHASE_UNKNOWN)
+            self._update_gui_elements() # Force GUI update, which will clear plot due to no pipeline_data
             self.webcam_label.clear_frame() # Clear video widget when stopping
             self.statusBar.showMessage("Previewing... Adjust position and press 'Start Tracking'.")
 
@@ -765,7 +992,7 @@ class MainWindow(QMainWindow):
             },
             'signal_generator': {
                 'SIGNAL_AGGREGATION_METHOD': self.aggMethod_combo.currentText(),
-                'CALCULATE_LEVEL_SIGNAL': self.calcLevelSignal_check.isChecked() # Add new setting
+                'CALCULATE_LEVEL_SIGNAL': True # Always True now
             },
             'signal_processor': {
                 'SIGNAL_FILTER_LOW_HZ': self.filtLow_spin.value(),
@@ -773,7 +1000,18 @@ class MainWindow(QMainWindow):
                 'SIGNAL_FILTER_METHOD': self.filtType_combo.currentText(),
                 'EMA_ALPHA': self.emaAlpha_spin.value(), # Add EMA Alpha
                 # Convert 0.0 from spinbox back to None for peak detection logic (already handled)
-                'PEAK_DETECT_PROMINENCE': self.peakProm_spin.value() if self.peakProm_spin.value() > 1e-6 else None
+                'PEAK_DETECT_PROMINENCE': self.peakProm_spin.value() if self.peakProm_spin.value() > 1e-6 else None,
+                'PAD_TYPE': self.padType_combo.currentText(),
+                'PAD_LEN': self.padLen_spin.value(),
+                # Level signal processing settings for SignalProcessor
+                'PROCESS_LEVEL_SIGNAL_ENABLED': True, # Permanently enabled
+                'LEVEL_SIGNAL_DRIFT_CORRECTION_ENABLED': self.levelDriftCorrection_check.isChecked(),
+                'LEVEL_SIGNAL_LIGHT_EMA_ALPHA': self.levelLightEmaAlpha_spin.value() if self.levelLightEma_check.isChecked() else None,
+                'LEVEL_SIGNAL_BASELINE_EMA_ALPHA': self.levelBaselineEmaAlpha_spin.value(),
+                'LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS': self.levelNormWindow_spin.value(),
+                'LEVEL_SIGNAL_NORMALIZE_TO_MINUS_ONE_ONE': self.levelNormToMinusOne_check.isChecked(),
+                'LEVEL_SIGNAL_NORMALIZATION_EPSILON': self.levelNormEpsilon_spin.value()
+
             }
         }
 
@@ -822,6 +1060,14 @@ class MainWindow(QMainWindow):
 
     # --- Slots for Backend Signals ---
 
+    @pyqtSlot(dict)
+    def handle_worker_output(self, results_dict: dict):
+        """Receives the full results dictionary from the PipelineWorker and stores it."""
+        # This is the central point where data from the backend updates the UI's data store.
+        # print(f"[UI Main - Slot] Received worker output. Keys: {list(results_dict.keys())}") # Optional: Verbose Debug
+        self.pipeline_data = results_dict # Store the new data
+        self._update_gui_elements()      # Immediately update the GUI with the new data
+
     def update_webcam_feed(self, frame):
         """Receives a numpy frame, converts to QImage, and updates the VideoWidget."""
         try:
@@ -861,20 +1107,22 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(f"Error displaying frame: {e}", 3000)
 
 
-    def update_plot(self, plot_data):
-        """Updates the plot widget with new data."""
-        if plot_data is None: plot_data = []
-        if not isinstance(plot_data, (list, np.ndarray)):
-            print(f"Warning: Received invalid data type for plot: {type(plot_data)}")
-            self.plot_curve.setData([])
-            return
-        try:
-            data_len = len(plot_data)
-            if data_len == 0: self.plot_curve.setData([]); return
-            if data_len >= PLOT_BUFFER_SIZE: self.plot_data_buffer = np.array(plot_data[-PLOT_BUFFER_SIZE:])
-            else: self.plot_data_buffer[:data_len] = plot_data; self.plot_data_buffer[data_len:] = 0
-            self.plot_curve.setData(self.plot_data_buffer)
-        except Exception as e: print(f"Error updating plot: {e}"); traceback.print_exc(); self.plot_curve.setData([])
+    # def update_plot(self, plot_data):
+    #     """Updates the plot widget with new data.
+    #     DEPRECATED: Plot updates are now handled by _update_gui_elements using self.pipeline_data.
+    #     """
+    #     if plot_data is None: plot_data = []
+    #     if not isinstance(plot_data, (list, np.ndarray)):
+    #         print(f"Warning (old update_plot): Received invalid data type for plot: {type(plot_data)}")
+    #         self.plot_curve.setData([])
+    #         return
+    #     try:
+    #         data_len = len(plot_data)
+    #         if data_len == 0: self.plot_curve.setData([]); return
+    #         if data_len >= PLOT_BUFFER_SIZE: self.plot_data_buffer = np.array(plot_data[-PLOT_BUFFER_SIZE:])
+    #         else: self.plot_data_buffer[:data_len] = plot_data; self.plot_data_buffer[data_len:] = 0
+    #         self.plot_curve.setData(self.plot_data_buffer)
+    #     except Exception as e: print(f"Error updating plot (old update_plot): {e}"); traceback.print_exc(); self.plot_curve.setData([])
 
 
     def update_status_labels(self, bpm, is_valid, phase):
@@ -977,6 +1225,11 @@ class MainWindow(QMainWindow):
         """Populates the settings widgets from a dictionary (e.g., loaded from JSON)."""
         print("[UI] Populating settings widgets with:", json.dumps(settings_dict, indent=2))
         try:
+            # --- Default empty dicts for robustness ---
+            sg_settings = settings_dict.get('signal_generator', {})
+            sp_settings = settings_dict.get('signal_processor', {})
+            # osc_settings = settings_dict.get('osc_sender', {})
+            video_settings = settings_dict.get('video_input', {})
             feature_tracker_settings = settings_dict.get('feature_tracker', {}); optical_flow_params = feature_tracker_settings.get('OPTICAL_FLOW_PARAMS', {}); feature_params = optical_flow_params.get('feature_params', {}); lk_params = optical_flow_params.get('lk_params', {})
             signal_generator_settings = settings_dict.get('signal_generator', {}); signal_processor_settings = settings_dict.get('signal_processor', {})
             self.maxCorners_spin.setValue(feature_params.get('maxCorners', 100)); self.qualityLevel_spin.setValue(feature_params.get('qualityLevel', 0.3)); self.minDistance_spin.setValue(feature_params.get('minDistance', 7))
@@ -988,10 +1241,23 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage("Settings populated.", 3000)
             # Populate EMA Alpha
             self.emaAlpha_spin.setValue(signal_processor_settings.get('EMA_ALPHA', 0.1))
-            # Populate Calculate Level Signal checkbox
-            self.calcLevelSignal_check.setChecked(signal_generator_settings.get('CALCULATE_LEVEL_SIGNAL', False))
+            # Populate Calculate Level Signal checkbox (from SignalGenerator settings)
+            # For permanent enable, ensure it's checked. It's already set and disabled in _init_ui.
+            # This line primarily ensures that if a profile *somehow* had it as False, UI still shows True.
+            self.calcLevelSignal_check.setChecked(True) 
+            
+            # Populate Level Signal Processing widgets (from SignalProcessor settings)
+            self.levelDriftCorrection_check.setChecked(sp_settings.get('LEVEL_SIGNAL_DRIFT_CORRECTION_ENABLED', True))
+            light_ema_alpha = sp_settings.get('LEVEL_SIGNAL_LIGHT_EMA_ALPHA', None)
+            self.levelLightEma_check.setChecked(light_ema_alpha is not None)
+            self.levelLightEmaAlpha_spin.setValue(light_ema_alpha if light_ema_alpha is not None else 0.6)
+            self.levelBaselineEmaAlpha_spin.setValue(sp_settings.get('LEVEL_SIGNAL_BASELINE_EMA_ALPHA', 0.002))
+            self.levelNormWindow_spin.setValue(sp_settings.get('LEVEL_SIGNAL_NORMALIZATION_WINDOW_SECONDS', 15.0))
+            self.levelNormToMinusOne_check.setChecked(sp_settings.get('LEVEL_SIGNAL_NORMALIZE_TO_MINUS_ONE_ONE', True))
+            self.levelNormEpsilon_spin.setValue(sp_settings.get('LEVEL_SIGNAL_NORMALIZATION_EPSILON', 0.01))
+
             # Update enabled state of filter params based on loaded method
-            self._update_filter_param_widgets_state_main_ui()
+            self._update_level_signal_widgets_state_main_ui() # Update for level signal group
         except Exception as e: print(f"Error populating settings widgets: {e}"); traceback.print_exc(); self.statusBar.showMessage("Error loading settings into UI.", 3000); QMessageBox.warning(self, "Settings Error", f"Could not fully populate settings widgets:\n{e}")
 
     def _update_filter_param_widgets_state_main_ui(self):
@@ -1011,6 +1277,37 @@ class MainWindow(QMainWindow):
         # EMA specific params
         self.emaAlpha_spin.setEnabled(is_ema)
 
+    def _update_level_signal_widgets_state_main_ui(self):
+        """Enables/disables level signal parameter widgets in the main UI."""
+        # Group is enabled if SignalGenerator is set to calculate level signal
+        group_enabled = self.calcLevelSignal_check.isChecked()
+        self.lsp_group.setEnabled(group_enabled) # Enable/disable the whole groupbox
+
+        if group_enabled: # Only update individual widgets if group is enabled
+            drift_correction_ui_enabled = self.levelDriftCorrection_check.isChecked()
+            light_ema_ui_enabled = self.levelLightEma_check.isChecked()
+
+            self.levelDriftCorrection_check.setEnabled(True) # Always enabled if group is enabled
+            self.levelLightEma_check.setEnabled(True)      # Always enabled if group is enabled
+            self.levelLightEmaAlpha_spin.setEnabled(light_ema_ui_enabled)
+            self.levelBaselineEmaAlpha_spin.setEnabled(drift_correction_ui_enabled)
+            # Other widgets (norm window, norm target, epsilon) are always enabled if group is enabled
+            self.levelNormWindow_spin.setEnabled(True)
+            self.levelNormToMinusOne_check.setEnabled(True)
+            self.levelNormEpsilon_spin.setEnabled(True)
+        # If group_enabled is false, the setEnabled(False) on lsp_group handles children.
+
+        # Update the enabled state of the main plot toggle button
+        if hasattr(self, 'toggle_main_plot_button'):
+            self.toggle_main_plot_button.setEnabled(group_enabled)
+            if not group_enabled and self.main_plot_shows_level:
+                # If level signal calculation was just turned off and we were showing it,
+                # switch back to differential view and update the button text.
+                print("[UI State] Level signal calculation disabled, switching plot to differential.")
+                self.main_plot_shows_level = False
+                self._update_main_plot_button_text()
+                # Force GUI update to reflect the change immediately
+                self._update_gui_elements() 
 
     def closeEvent(self, event):
         """Ensures tracking is stopped when the window is closed."""
